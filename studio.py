@@ -9,6 +9,8 @@
 
 交互命令（直接输入文字 = 用预览步数出图）：
   /final [步数]     用上一条提示词、同种子同尺寸出正式图（默认 --final 步数）
+  /refine [强度] [步数] [文件名.png]  以当前种子的预览图（或指定图片）为底稿精修（默认 0.5，步数默认 --final）；
+                   保留预览的构图和结构，适合手部等易变形的画面
   /batch N         上一条提示词连换 N 个种子各出一张预览（seed, seed+1, ...）
   /seed N | /seed +   设种子 / 种子 +1
   /size WxH        设尺寸（预览和正式图要一致，否则构图不同）
@@ -28,6 +30,7 @@
   /quit
 """
 import argparse
+import copy
 import gc
 import os
 import subprocess
@@ -40,16 +43,19 @@ try:
 except ImportError:
     pass
 
+import numpy as np
 import torch
 from diffusers import LongCatImagePipeline
-from diffusers.pipelines.longcat_image.pipeline_longcat_image import prepare_pos_ids
+from diffusers.pipelines.longcat_image.pipeline_longcat_image import calculate_shift, prepare_pos_ids
+from PIL import Image
 from optimum.quanto import freeze, qint8, quantize
 from transformers import Qwen2_5_VLForConditionalGeneration
 
 from presets import GROUPS, MULTI, NEGATIVES, RATIOS
 
 COMMANDS = {
-    "/final": "用上一条提示词出正式图",
+    "/final": "用上一条提示词出正式图（重新生成，结构可能变）",
+    "/refine": "以当前种子的预览图为底稿精修（保留构图和手指结构）",
     "/batch": "换 N 个种子各出一张预览",
     "/seed": "设种子（+ 表示加 1）",
     "/ratio": "画幅预设",
@@ -76,6 +82,8 @@ NUMERIC = {
     "/final": [("25", "一般画面，默认"), ("30", "手部、毛发等细节多的画面"), ("20", "较快，细节略少"),
                ("50", "官方默认，比 30 提升很小，耗时近翻倍")],
     "/steps": [("8", "预览默认，看构图和内容"), ("6", "更快，较糊"), ("12", "预览更清楚一些")],
+    "/refine": [("0.5", "默认：保留结构，补细节"), ("0.4", "更忠于预览图，改动最小"),
+                ("0.6", "细节更多，结构可能小改"), ("0.7", "改动较大")],
     "/batch": [("4", "一次抽 4 个种子"), ("2", "快速对比"), ("8", "多抽几个挑选，耗时较长")],
     "/seed": [("+", "换下一个种子"), ("43", "默认种子")],
     "/cfg": [("4", "默认，推荐"), ("3", "更自由，贴合度略低"), ("5", "更贴合提示词"),
@@ -224,6 +232,35 @@ class Studio:
         self.done = {}  # (实际提示词, 负面, 宽, 高, 步数, 种子, cfg) -> 图片路径
         os.makedirs(OUT_DIR, exist_ok=True)
         self.idx = len([f for f in os.listdir(OUT_DIR) if f.endswith(".png")])
+        self.load_history()
+
+    def load_history(self):
+        """从 outputs/log.txt 恢复已生成图片的参数，重启后 /refine 和去重仍然可用。"""
+        import ast
+        import re
+        log = os.path.join(OUT_DIR, "log.txt")
+        if not os.path.exists(log):
+            return
+        pat = re.compile(r"^\d+_s(\d+)_(\d+)st_(\d+)x(\d+)(?:_refine([\d.]+))?\.png$")
+        records = []  # 早期记录里提示词带换行会断成多行：没有 tab 的行接到上一条后面
+        for line in open(log, encoding="utf-8"):
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) == 4 and parts[1].startswith("cfg=") and parts[2].startswith("neg="):
+                records.append(parts)
+            elif records and "\t" not in line:
+                records[-1][3] += " " + line.rstrip("\n")  # 换行在 key 里等价于空格
+        for name, cfg, neg, prompt in records:
+            m = pat.match(name)
+            path = os.path.join(OUT_DIR, name)
+            if not m or not os.path.exists(path):
+                continue
+            seed, steps, w, h, strength = m.groups()
+            try:
+                k = (" ".join(prompt.split()), ast.literal_eval(neg[4:]), int(w), int(h), int(steps), int(seed),
+                     float(cfg[4:]))
+            except (ValueError, SyntaxError):
+                continue
+            self.done[k + ((float(strength),) if strength else ())] = path
 
     def embeds(self, text):
         if text not in self.cache:
@@ -239,11 +276,12 @@ class Studio:
         return "，".join(parts)
 
     def key(self, prompt, steps, seed):
-        return (self.compose(prompt), self.neg, self.w, self.h, steps, seed, self.cfg)
+        return (" ".join(self.compose(prompt).split()), self.neg, self.w, self.h, steps, seed, self.cfg)
 
-    def generate(self, prompt, steps, seed=None):
+    def generate(self, prompt, steps, seed=None, refine=None):
+        """refine=(源图路径, 强度)：以源图为底稿精修，只重画后半段去噪，保留构图和结构。"""
         seed = self.seed if seed is None else seed
-        k = self.key(prompt, steps, seed)
+        k = self.key(prompt, steps, seed) + ((refine[1],) if refine else ())
         if k in self.done:
             print(f"  参数和种子都没变，结果会一模一样，直接打开已有的：{self.done[k]}")
             print("  想要不同的图：/seed + 换种子，或 /batch N")
@@ -251,22 +289,30 @@ class Studio:
                 subprocess.run(["open", self.done[k]])
             return
         prompt = self.compose(prompt)
-        print(f"  生成中：{self.w}x{self.h}，{steps} 步，seed {seed}（算完才有输出，请稍候）...", flush=True)
+        extra, tag = {}, ""
+        if refine:
+            extra = self.refine_inputs(refine[0], steps, refine[1], seed)
+            tag = f"_refine{refine[1]:g}"
+            print(f"  精修中：以 {refine[0]} 为底稿，强度 {refine[1]:g}，"
+                  f"实际只跑 {len(extra['sigmas'])}/{steps} 步（算完才有输出，请稍候）...", flush=True)
+        else:
+            print(f"  生成中：{self.w}x{self.h}，{steps} 步，seed {seed}（算完才有输出，请稍候）...", flush=True)
         t0 = time.time()
         img = self.pipe(
+            **extra,
             prompt=None,
             prompt_embeds=self.embeds(prompt),
             negative_prompt_embeds=self.embeds(self.neg),
             height=self.h,
             width=self.w,
             guidance_scale=self.cfg,
-            num_inference_steps=steps,
+            num_inference_steps=len(extra["sigmas"]) if refine else steps,
             generator=torch.Generator("cpu").manual_seed(seed),
             enable_cfg_renorm=True,
             enable_prompt_rewrite=False,
         ).images[0]
         self.idx += 1
-        path = os.path.join(OUT_DIR, f"{self.idx:03d}_s{seed}_{steps}st_{self.w}x{self.h}.png")
+        path = os.path.join(OUT_DIR, f"{self.idx:03d}_s{seed}_{steps}st_{self.w}x{self.h}{tag}.png")
         img.save(path)
         self.done[k] = path
         with open(os.path.join(OUT_DIR, "log.txt"), "a", encoding="utf-8") as f:
@@ -275,6 +321,33 @@ class Studio:
         if self.auto_open:
             subprocess.run(["open", path])
         torch.mps.empty_cache()
+
+    @torch.no_grad()
+    def refine_inputs(self, src, steps, strength, seed):
+        """把源图编码成潜变量，按强度加噪，返回 pipeline 的 latents 和截断后的 sigmas。"""
+        pipe = self.pipe
+        full = np.linspace(1.0, 1.0 / steps, steps)  # 与 pipeline 默认一致
+        sigmas = full[full <= strength + 1e-6]
+        if len(sigmas) == 0:
+            sigmas = full[-1:]
+        # pipeline 会对 sigmas 做动态 shift，起始噪声强度要按 shift 后的值算
+        seq_len = (self.h // 16) * (self.w // 16)
+        cfg = pipe.scheduler.config
+        mu = calculate_shift(seq_len, cfg.get("base_image_seq_len", 256), cfg.get("max_image_seq_len", 4096),
+                             cfg.get("base_shift", 0.5), cfg.get("max_shift", 1.15))
+        sched = copy.deepcopy(pipe.scheduler)
+        sched.set_timesteps(sigmas=sigmas, mu=mu, device="cpu")
+        s0 = float(sched.sigmas[0])
+
+        img = Image.open(src).convert("RGB")
+        x = pipe.image_processor.preprocess(img, self.h, self.w).to(DEVICE, pipe.vae.dtype)
+        lat = pipe.vae.encode(x).latent_dist.mode()
+        lat = (lat - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
+        noise = torch.randn(lat.shape, generator=torch.Generator("cpu").manual_seed(seed)).to(DEVICE, lat.dtype)
+        lat = (1 - s0) * lat + s0 * noise  # flow matching：x_t = (1-σ)·x0 + σ·ε
+        b, c, h, w = lat.shape
+        packed = pipe._pack_latents(lat, b, c, h, w)
+        return {"latents": packed.to(DTYPE), "sigmas": list(sigmas)}
 
     def show(self):
         print(f"  尺寸 {self.w}x{self.h} | 预览 {self.preview_steps} 步 | 正式 {self.final_steps} 步 | "
@@ -322,6 +395,29 @@ class Studio:
         if cmd == "/final":
             if self.need_prompt():
                 self.generate(self.last_prompt, int(arg) if arg else self.final_steps)
+        elif cmd == "/refine":
+            if self.need_prompt():
+                parts = arg.split()
+                files = [x for x in parts if x.endswith(".png")]
+                nums = [x for x in parts if not x.endswith(".png")]
+                strength = float(nums[0]) if nums else 0.5
+                steps = int(nums[1]) if len(nums) > 1 else self.final_steps
+                if files:  # 直接指定底稿文件：种子和尺寸取自文件名
+                    src = files[0] if os.path.exists(files[0]) else os.path.join(OUT_DIR, files[0])
+                    import re
+                    m = re.search(r"_s(\d+)_\d+st_(\d+)x(\d+)", os.path.basename(src))
+                    if not os.path.exists(src):
+                        print(f"  找不到文件：{src}")
+                        return
+                    if m:
+                        self.seed, self.w, self.h = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                else:
+                    src = self.done.get(self.key(self.last_prompt, self.preview_steps, self.seed))
+                if not src:
+                    print(f"  种子 {self.seed} 还没有当前设置下的预览图。先出预览，或直接指定文件："
+                          f"/refine 0.5 011_s45_8st_512x512.png")
+                else:
+                    self.generate(self.last_prompt, steps, refine=(src, strength))
         elif cmd == "/batch":
             if self.need_prompt():
                 n, s, seeds = int(arg) if arg else 4, self.seed, []
