@@ -70,6 +70,7 @@ env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
 
 - 输入 `/` 会弹出全部命令和说明；继续输入可以筛选，比如 `/st` 只剩 `/style`、`/steps`。
 - 选中命令后会接着弹出参数菜单，比如 `/style ` 后面列出全部风格和对应的描述。
+- 数值类命令（`/final`、`/steps`、`/cfg`、`/size`、`/batch`、`/seed`）会列出常用值和说明，也可以直接输入其他数字。
 - 用 ↑↓ 选择，按回车或 Tab 确认。选中命令时回车只填入命令；选中参数时回车直接执行。
 - ↑↓ 在没有菜单时用来翻历史输入，历史保存在 `outputs/.history`。
 
