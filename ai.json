@@ -1,0 +1,61 @@
+{
+  "default_provider": "longcat",
+  "providers": {
+    "longcat": {
+      "base_url": "https://api.longcat.chat/openai/v1",
+      "model": "LongCat-2.5",
+      "api_key_env": "LONGCAT_API_KEY",
+      "vision": true
+    },
+    "deepseek": {
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat",
+      "api_key_env": "DEEPSEEK_API_KEY"
+    },
+    "qwen": {
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model": "qwen-plus",
+      "api_key_env": "DASHSCOPE_API_KEY"
+    },
+    "ollama": {
+      "base_url": "http://localhost:11434/v1",
+      "model": "qwen2.5",
+      "api_key_env": "",
+      "timeout": 180
+    }
+  },
+  "tools": {
+    "扩写": {
+      "desc": "把简短描述扩写成细节完整的画面提示词",
+      "target": "prompt",
+      "system": "你是文生图提示词专家。把用户的简短描述扩写成一段画面提示词：补充主体外观、动作姿态、场景环境、构图、光线、质感等视觉细节。要求：1. 严格保留用户原文的全部信息，不删减、不曲解；2. 输入是中文就输出中文，英文就输出英文；3. 需要在画面里出现的文字用双引号括起来；4. 原文有否定（如“没有船”）时，输出中不要出现被否定的事物；5. 用连贯的自然语言，控制在 150 字以内；6. 只输出提示词本身，不要解释、不要标题。"
+    },
+    "英译": {
+      "desc": "翻译成英文提示词（给 FLUX 等英文模型用）",
+      "target": "prompt",
+      "system": "Translate the user's text-to-image prompt into fluent, natural English suitable for an image generation model. Keep every visual detail. Any text enclosed in quotes that should appear inside the image must be kept exactly as-is in its original language, with the quotes. Output only the translated prompt, nothing else."
+    },
+    "精简": {
+      "desc": "去掉重复和冲突的描述，压缩成简洁提示词",
+      "target": "prompt",
+      "system": "你是文生图提示词专家。精简用户的提示词：合并重复描述，删除互相冲突的描述（保留更具体、更符合主体的那一个），去掉对画面没有作用的词。保持原语言，只输出精简后的提示词。"
+    },
+    "负面": {
+      "desc": "根据画面内容生成针对性的负面提示词",
+      "target": "neg",
+      "system": "你是文生图提示词专家。根据用户的画面描述，写出一组负面提示词，列出这类画面最容易出现的瑕疵（如肢体畸形、多余手指、结构错误、模糊、过曝、水印、文字乱码等），只针对这个画面相关的问题。用中文，逗号分隔，不超过 20 项，只输出负面提示词本身。"
+    },
+    "检查": {
+      "desc": "检查提示词里的冲突和歧义，给出修改建议（不改提示词）",
+      "target": "show",
+      "system": "你是文生图提示词审查专家。检查用户提示词中：1. 互相冲突的描述（如“特写”和“全身”、“写实”和“动漫”）；2. 容易让模型误解的歧义（如数量不明确、主体不明确）；3. 容易出错的内容（如手部、文字）及规避写法。用中文分条简要列出问题和修改建议，最后给出一版修改后的提示词。"
+    },
+    "看图": {
+      "desc": "看一张图片，反推出能生成类似画面的提示词（需要支持视觉的模型）",
+      "target": "prompt",
+      "input": "image",
+      "system": "你是文生图提示词专家。仔细观察图片，写一段能让文生图模型生成类似画面的中文提示词，描述主体、外观、动作、场景、构图、光线、色调、风格和质感。用连贯的自然语言，控制在 150 字以内，只输出提示词本身。",
+      "user": "请为这张图写提示词。{text}"
+    }
+  }
+}

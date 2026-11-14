@@ -1,0 +1,7 @@
+mflux==0.24.0
+mlx==0.32.4
+mlx-metal==0.32.4
+modelscope==1.40.3
+numpy==2.5.4
+pillow==13.0.0
+prompt_toolkit==3.0.53

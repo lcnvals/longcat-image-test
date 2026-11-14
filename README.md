@@ -1,8 +1,8 @@
 # LongCat-Image on Apple Silicon
 
-在 Apple Silicon Mac 上本地运行美团 [LongCat-Image](https://github.com/meituan-longcat/LongCat-Image)（6B 文生图模型）的推理脚本。
+在 Apple Silicon Mac 上本地运行文生图模型的交互工作台。最初为美团 [LongCat-Image](https://github.com/meituan-longcat/LongCat-Image)（6B）编写，现在同时支持 MLX 原生的 Z-Image-Turbo 和 FLUX.2 klein 4B，并可接入大模型 API 处理提示词。
 
-官方示例针对 CUDA，并用 `enable_model_cpu_offload()` 节省显存；Mac 是统一内存，这个办法省不了内存。本仓库改用 MPS，并通过分段加载 / int8 量化让模型在 32GB 内存的 Mac 上跑起来。
+LongCat 的官方示例针对 CUDA，并用 `enable_model_cpu_offload()` 节省显存；Mac 是统一内存，这个办法省不了内存。本仓库改用 MPS，并通过分段加载 / int8 量化让模型在 32GB 内存的 Mac 上跑起来。
 
 | 脚本 | 用途 | 状态 |
 |---|---|---|
@@ -10,6 +10,24 @@
 | `t2i.py` | 单次文生图，文本编码器和 transformer 分段加载 | 已在 M1 Pro 32GB 上测试 |
 | `edit.py` | LongCat-Image-Edit-Turbo 改图（照片 + 指令） | 未实测 |
 | `presets.py` | `studio.py` 用的提示词预设，可以自己加 | — |
+| `backends.py` | 模型后端：longcat（PyTorch）、z-image-turbo、flux2-klein-4b（mflux/MLX） | 三个都实测过 |
+| `ai.py`、`ai.json` | AI 提示词工具：调用 OpenAI 兼容接口扩写、翻译、看图反推等，可自定义 | 用模拟接口测过，真实接口未测 |
+
+## 模型选择（M1 Pro 32GB 实测）
+
+1024×1024，种子 43，mflux 模型 8-bit 量化。时间为单张出图耗时（不含首次加载）。
+
+| 模型 | `--model` | 单张耗时 | 内存峰值 | 中文文字渲染 | 手部 | 许可 |
+|---|---|---|---|---|---|---|
+| FLUX.2 klein 4B | `flux2-klein-4b` | 约 57–61 秒（4 步）；512×512 约 18 秒 | 约 9GB（精修 13GB） | ❌ 乱码 | 少一根手指 | Apache 2.0 |
+| Z-Image-Turbo | `z-image-turbo` | 约 190 秒（9 步） | 约 12GB（精修 19GB） | ✅ “深夜食堂”“营业中”完全正确 | ✅ 五指正确 | Apache 2.0 |
+| LongCat-Image | `longcat`（默认） | 512×512、20 步约 3.5 分钟 | 约 21GB 常驻 | 未系统测试 | 8 步预览时常出错 | Apache 2.0 |
+
+- **要中文文字（海报、招牌）或手部**：选 Z-Image-Turbo，最稳但最慢。
+- **要快速出图、试构图**：选 FLUX.2 klein 4B，画质好，但中文文字不行。
+- **24GB 的 Mac（如 M4 Mac mini）**：优先用两个 MLX 模型。Z-Image 精修时峰值 19GB 偏紧，可以加 `--quantize 4` 降低内存（未实测画质）。
+- 蒸馏模型（FLUX.2 klein、Z-Image-Turbo）**不支持 CFG 和负面提示词**，`/cfg`、`/neg` 会提示不生效。
+- 两个蒸馏模型本身就是满步数出图，`/refine` 能保留结构，但细节提升不明显。
 
 ## 硬件要求
 
@@ -37,6 +55,13 @@ python3 -m venv .venv
 
 `requirements.txt` 把 diffusers 锁定在一个包含 LongCat 管线的 git commit 上，这个版本需要 transformers 5.x。
 
+使用 Z-Image-Turbo / FLUX.2 klein 时另建一个 MLX 环境（和上面的 PyTorch 环境依赖不兼容，分开装）：
+
+```bash
+python3 -m venv .venv-mlx
+.venv-mlx/bin/pip install -r requirements-mlx.txt
+```
+
 ## 下载模型
 
 国内从魔搭（ModelScope）直连最快（实测总速度约 28MB/s，约 20 分钟下完）。从 Hugging Face 走代理时，大文件 CDN 只有几十 KB/s。
@@ -56,9 +81,32 @@ env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
   --local-dir ./model --max-workers 8
 ```
 
+MLX 模型（`studio.py --model` 用，放在 `models/` 下）：
+
+```bash
+# zsh 里先清掉代理变量
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+# Z-Image-Turbo，约 33GB（transformer 是 fp32，加载时量化）
+.venv-mlx/bin/modelscope download --model Tongyi-MAI/Z-Image-Turbo \
+  --local-dir ./models/z-image-turbo --max-workers 8
+# FLUX.2 klein 4B，约 16GB（排除重复的单文件权重）
+.venv-mlx/bin/modelscope download --model black-forest-labs/FLUX.2-klein-4B \
+  --local-dir ./models/flux2-klein-4b --exclude 'flux-2-klein-4b.safetensors' --max-workers 8
+```
+
 ## 使用
 
 ### studio.py：常驻交互模式（推荐）
+
+用 `--model` 选模型，不同模型要用对应的虚拟环境：
+
+```bash
+.venv/bin/python studio.py                             # LongCat-Image（默认）
+.venv-mlx/bin/python studio.py --model z-image-turbo   # Z-Image-Turbo
+.venv-mlx/bin/python studio.py --model flux2-klein-4b  # FLUX.2 klein 4B
+```
+
+每个模型的默认尺寸和步数不同：LongCat 768×768、预览 8 步、正式 25 步；MLX 模型 1024×1024，FLUX.2 klein 4 步，Z-Image 9 步。各模型的图片和历史分开保存：LongCat 在 `outputs/`，其他在 `outputs/<模型名>/`。
 
 ```bash
 .venv/bin/python studio.py --size 768x768
@@ -145,11 +193,64 @@ longcat> 一位中国年轻女性在咖啡馆看书
 .venv/bin/python studio.py --ratio 竖图 --shot 半身 --light 窗光 --style 人像 --neg 人像
 ```
 
-启动参数：`--size`（默认 768x768）、`--ratio`（会覆盖 `--size`）、`--preview`（默认 8）、`--final`（默认 25）、`--seed`（默认 43）、`--shot`、`--light`、`--tone`、`--time`、`--detail`（可多个，如 `--detail 毛发 锐利`）、`--style`、`--neg`、`--quant-transformer`（transformer 也量化为 int8，24GB 机器用，未实测）。
+启动参数：`--model`、`--size`（默认按模型）、`--ratio`（会覆盖 `--size`）、`--preview`（默认 8）、`--final`（默认 25）、`--seed`（默认 43）、`--shot`、`--light`、`--tone`、`--time`、`--detail`（可多个，如 `--detail 毛发 锐利`）、`--style`、`--neg`、`--quant-transformer`（LongCat 的 transformer 也量化为 int8，24GB 机器用，未实测）、`--quantize`（MLX 模型量化位数，默认 8）、`--ai-provider`、`--ai-auto`。
 
 图片保存在 `outputs/`，文件名带编号、种子、步数、尺寸，比如 `003_s45_25st_768x768.png`。每张图的提示词记录在 `outputs/log.txt`。
 
 **内存方案**：文本编码器用 optimum-quanto 量化为 int8（16.6GB 降到约 8.5GB），和 bf16 的 transformer 一起常驻 MPS，合计约 21GB。实测量化后的出图和 bf16 几乎一致。
+
+#### AI 提示词工具
+
+用大模型 API 处理提示词。服务商和工具都在配置文件里，可以自己加。
+
+```
+/ai                    列出所有工具和当前服务商
+/ai 扩写                扩写上一条提示词（也可以 /ai 扩写 一只猫）
+/use                   采用 AI 结果作为新提示词并出预览
+/ai 负面                根据画面生成针对性的负面提示词，直接生效
+/ai 检查                检查提示词里的冲突和歧义，给出修改建议
+/ai 看图 照片.png        看图反推提示词（需要支持视觉的模型）
+/ai 精简                去掉重复和冲突的描述
+/ai auto 英译           之后每次出图前自动翻译成英文（给英文更强的模型用）
+/ai provider deepseek  切换服务商
+```
+
+内置服务商（都走 OpenAI 兼容的 `/chat/completions` 接口）：
+
+| 服务商 | 模型 | 密钥环境变量 |
+|---|---|---|
+| `longcat`（默认） | LongCat-2.5，支持看图 | `LONGCAT_API_KEY`（在 https://longcat.chat/platform/api_keys 申请） |
+| `deepseek` | deepseek-chat | `DEEPSEEK_API_KEY` |
+| `qwen` | qwen-plus | `DASHSCOPE_API_KEY` |
+| `ollama` | 本地模型，不需要密钥 | — |
+
+密钥只从环境变量读取，不写进任何文件：
+
+```bash
+export LONGCAT_API_KEY=你的密钥
+.venv-mlx/bin/python studio.py --model z-image-turbo --ai-auto 扩写
+```
+
+LongCat 官方 API 目前只提供 LongCat-2.5（对话和看图），没有图像生成接口，所以出图仍在本地。
+
+**自定义**：新建 `ai.local.json`（不进仓库），同名项覆盖 `ai.json`。比如加一个服务商和一个工具：
+
+```json
+{
+  "providers": {
+    "my-llm": {"base_url": "https://example.com/v1", "model": "模型名", "api_key_env": "MY_LLM_KEY"}
+  },
+  "tools": {
+    "小红书": {
+      "desc": "改写成小红书封面风格的画面描述",
+      "target": "prompt",
+      "system": "把用户描述改写成适合小红书封面的画面：明亮清新、主体居中、留出标题空间。只输出提示词。"
+    }
+  }
+}
+```
+
+工具字段：`target` 决定结果去向（`prompt` 新提示词、`neg` 负面提示词、`show` 只显示）；`input: "image"` 表示要传图片；`provider` 可以给单个工具指定服务商；`user` 是用户消息模板，`{text}` 会替换成提示词。
 
 ### t2i.py：单次出图
 
