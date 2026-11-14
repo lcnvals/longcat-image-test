@@ -114,9 +114,23 @@ def make_prompt_session():
                     yield Completion(value, start_position=-len(arg), display_meta=desc)
 
     from prompt_toolkit.filters import completion_is_selected
+    from prompt_toolkit.application import get_app
     from prompt_toolkit.key_binding import KeyBindings
 
     kb = KeyBindings()
+
+    from prompt_toolkit.filters import Condition, has_completions
+
+    @Condition
+    def partial_command():
+        text = get_app().current_buffer.text
+        return text.startswith("/") and " " not in text and text not in COMMANDS
+
+    @kb.add("enter", filter=has_completions & ~completion_is_selected & partial_command)
+    def _(event):
+        # 输入 "/ne" 回车：补成第一个匹配的命令（/neg ），不提交半截命令
+        buf = event.current_buffer
+        buf.apply_completion(buf.complete_state.completions[0])
 
     @kb.add("enter", filter=completion_is_selected)
     def _(event):
@@ -195,6 +209,7 @@ class Studio:
                     for key in GROUPS}
         self.last_prompt = None
         self.cache = {}
+        self.done = {}  # (实际提示词, 负面, 宽, 高, 步数, 种子, cfg) -> 图片路径
         os.makedirs(OUT_DIR, exist_ok=True)
         self.idx = len([f for f in os.listdir(OUT_DIR) if f.endswith(".png")])
 
@@ -211,8 +226,18 @@ class Studio:
             parts += [table[n] for n in names]
         return "，".join(parts)
 
+    def key(self, prompt, steps, seed):
+        return (self.compose(prompt), self.neg, self.w, self.h, steps, seed, self.cfg)
+
     def generate(self, prompt, steps, seed=None):
         seed = self.seed if seed is None else seed
+        k = self.key(prompt, steps, seed)
+        if k in self.done:
+            print(f"  参数和种子都没变，结果会一模一样，直接打开已有的：{self.done[k]}")
+            print("  想要不同的图：/seed + 换种子，或 /batch N")
+            if self.auto_open:
+                subprocess.run(["open", self.done[k]])
+            return
         prompt = self.compose(prompt)
         print(f"  生成中：{self.w}x{self.h}，{steps} 步，seed {seed}（算完才有输出，请稍候）...", flush=True)
         t0 = time.time()
@@ -231,8 +256,9 @@ class Studio:
         self.idx += 1
         path = os.path.join(OUT_DIR, f"{self.idx:03d}_s{seed}_{steps}st_{self.w}x{self.h}.png")
         img.save(path)
+        self.done[k] = path
         with open(os.path.join(OUT_DIR, "log.txt"), "a", encoding="utf-8") as f:
-            f.write(f"{os.path.basename(path)}\tcfg={self.cfg}\tneg={self.neg!r}\t{prompt}\n")
+            f.write(f"{os.path.basename(path)}\tcfg={self.cfg}\tneg={self.neg!r}\t{' '.join(prompt.split())}\n")
         print(f"  -> {path}  ({time.time() - t0:.0f}s)")
         if self.auto_open:
             subprocess.run(["open", path])
@@ -286,7 +312,13 @@ class Studio:
                 self.generate(self.last_prompt, int(arg) if arg else self.final_steps)
         elif cmd == "/batch":
             if self.need_prompt():
-                for s in range(self.seed, self.seed + (int(arg) if arg else 4)):
+                n, s, seeds = int(arg) if arg else 4, self.seed, []
+                while len(seeds) < n:  # 已经出过图的种子跳过，凑够 n 张新的
+                    if self.key(self.last_prompt, self.preview_steps, s) not in self.done:
+                        seeds.append(s)
+                    s += 1
+                print(f"  批量预览种子：{', '.join(map(str, seeds))}")
+                for s in seeds:
                     self.generate(self.last_prompt, self.preview_steps, seed=s)
                 print("  挑中哪张，就 /seed 那个数字，再 /final")
         elif cmd == "/seed":
