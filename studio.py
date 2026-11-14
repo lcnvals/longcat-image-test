@@ -5,6 +5,7 @@
 
 启动：
   .venv/bin/python studio.py [--size 768x768] [--preview 8] [--final 25] [--seed 43]
+          [--ratio 竖图] [--style 人像] [--shot 半身] [--light 窗光] [--tone 温馨] [--time 黄昏] [--neg 人像]
 
 交互命令（直接输入文字 = 用预览步数出图）：
   /final [步数]     用上一条提示词、同种子同尺寸出正式图（默认 --final 步数）
@@ -13,8 +14,14 @@
   /size WxH        设尺寸（预览和正式图要一致，否则构图不同）
   /steps N         设预览步数
   /cfg X           设 guidance_scale（默认 4.0）
-  /neg 文本         设负面提示词（空 = 清除）
-  /style [名称|off] 查看风格列表 / 选风格（追加到提示词后）/ 取消
+  /ratio [名称]     画幅预设（方图/竖图/壁纸/横图/宽屏/小方图），会改尺寸
+  /shot  [名称|off] 镜头构图      ┐
+  /light [名称|off] 光线          │ 不带参数 = 列出可选项
+  /tone  [名称|off] 色调氛围      │ 选中后自动追加到提示词后
+  /time  [名称|off] 时间天气      │ off = 取消
+  /style [名称|off] 风格          ┘
+  /neg [预设名|文本|off]  负面提示词：预设（通用/人像/风景/插画）或自定义文本；不带参数列出预设
+  /reset           清空所有追加预设和负面提示词
   /open on|off     出图后是否自动用"预览"打开
   /show            显示当前设置
   /quit
@@ -36,24 +43,7 @@ from diffusers.pipelines.longcat_image.pipeline_longcat_image import prepare_pos
 from optimum.quanto import freeze, qint8, quantize
 from transformers import Qwen2_5_VLForConditionalGeneration
 
-STYLES = {
-    "写实": "写实摄影风格，自然光线，细节清晰，高清照片质感",
-    "电影": "电影剧照风格，电影级布光，浅景深，宽银幕构图，色彩分级",
-    "胶片": "胶片摄影风格，柔和颗粒感，复古色调，轻微漏光",
-    "人像": "专业人像摄影，柔和侧光，背景虚化，皮肤质感细腻",
-    "动漫": "日系动漫风格，赛璐璐上色，线条干净，色彩明快",
-    "治愈动画": "手绘动画电影风格，温暖柔和的色彩，水彩质感背景，治愈氛围",
-    "3D卡通": "3D 卡通渲染风格，圆润造型，柔和全局光照，色彩饱和",
-    "水彩": "水彩画风格，颜料晕染，纸张纹理，留白，清新淡雅",
-    "油画": "古典油画风格，厚涂笔触，画布纹理，浓郁色彩",
-    "水墨": "中国水墨画风格，墨色浓淡变化，留白意境，宣纸质感",
-    "国潮": "国潮插画风格，中国传统纹样，红金配色，扁平装饰感",
-    "素描": "铅笔素描风格，黑白灰调，排线明暗，素描纸纹理",
-    "扁平插画": "扁平矢量插画风格，简洁几何形状，纯色块，无阴影",
-    "像素": "像素艺术风格，8-bit 复古游戏画面，有限调色板",
-    "赛博朋克": "赛博朋克风格，霓虹灯光，夜晚雨天街道，蓝紫色调，高科技感",
-    "蒸汽波": "蒸汽波美学风格，粉紫渐变，复古未来感，霓虹网格",
-}
+from presets import GROUPS, NEGATIVES, RATIOS
 
 MODEL = "./model-t2i"
 OUT_DIR = "./outputs"
@@ -93,14 +83,14 @@ def load(quant_transformer: bool) -> LongCatImagePipeline:
 class Studio:
     def __init__(self, pipe, a):
         self.pipe = pipe
-        self.w, self.h = map(int, a.size.lower().split("x"))
+        self.w, self.h = RATIOS[a.ratio] if a.ratio else map(int, a.size.lower().split("x"))
         self.preview_steps = a.preview
         self.final_steps = a.final
         self.seed = a.seed
         self.cfg = 4.0
-        self.neg = ""
+        self.neg = NEGATIVES.get(a.neg, a.neg or "")
         self.auto_open = True
-        self.style = a.style
+        self.sel = {key: getattr(a, key, None) for key in GROUPS}  # 各分组当前选中的预设名
         self.last_prompt = None
         self.cache = {}
         os.makedirs(OUT_DIR, exist_ok=True)
@@ -112,10 +102,13 @@ class Studio:
                 self.cache[text] = self.pipe._encode_prompt([text])
         return self.cache[text]
 
+    def compose(self, prompt):
+        parts = [prompt] + [table[self.sel[key]] for key, (_, _, table) in GROUPS.items() if self.sel[key]]
+        return "，".join(parts)
+
     def generate(self, prompt, steps, seed=None):
         seed = self.seed if seed is None else seed
-        if self.style:
-            prompt = f"{prompt}，{STYLES[self.style]}"
+        prompt = self.compose(prompt)
         print(f"  生成中：{self.w}x{self.h}，{steps} 步，seed {seed}（算完才有输出，请稍候）...", flush=True)
         t0 = time.time()
         img = self.pipe(
@@ -142,10 +135,27 @@ class Studio:
 
     def show(self):
         print(f"  尺寸 {self.w}x{self.h} | 预览 {self.preview_steps} 步 | 正式 {self.final_steps} 步 | "
-              f"seed {self.seed} | cfg {self.cfg} | 风格 {self.style or '无'} | neg {self.neg!r} | "
-              f"自动打开 {self.auto_open}")
+              f"seed {self.seed} | cfg {self.cfg} | 自动打开 {self.auto_open}")
+        print("  " + " | ".join(f"{label} {self.sel[key] or '-'}" for key, (_, label, _) in GROUPS.items()))
+        print(f"  负面提示词：{self.neg or '-'}")
         if self.last_prompt:
             print(f"  上一条提示词：{self.last_prompt}")
+            print(f"  实际提示词：{self.compose(self.last_prompt)}")
+
+    def pick(self, key, arg):
+        cmd, label, table = GROUPS[key]
+        if not arg:
+            for name, desc in table.items():
+                print(f"  {'*' if name == self.sel[key] else ' '} {name:<6} {desc}")
+            print(f"  用法：{cmd} {next(iter(table))}   取消：{cmd} off")
+        elif arg == "off":
+            self.sel[key] = None
+            self.show()
+        elif arg in table:
+            self.sel[key] = arg
+            self.show()
+        else:
+            print(f"  没有“{arg}”这个{label}，{cmd} 查看列表")
 
     def need_prompt(self):
         if not self.last_prompt:
@@ -177,21 +187,29 @@ class Studio:
             self.cfg = float(arg)
             self.show()
         elif cmd == "/neg":
-            self.neg = arg
-            self.show()
-        elif cmd == "/style":
             if not arg:
-                for name, desc in STYLES.items():
-                    print(f"  {'*' if name == self.style else ' '} {name:<6} {desc}")
-                print("  用法：/style 动漫   取消：/style off")
-            elif arg == "off":
-                self.style = None
+                for name, desc in NEGATIVES.items():
+                    print(f"  {'*' if desc == self.neg else ' '} {name:<4} {desc}")
+                print("  用法：/neg 人像（预设）  /neg 自定义文字  /neg off（清除）")
+            else:
+                self.neg = "" if arg == "off" else NEGATIVES.get(arg, arg)
                 self.show()
-            elif arg in STYLES:
-                self.style = arg
+        elif cmd == "/ratio":
+            if not arg:
+                for name, (w, h) in RATIOS.items():
+                    print(f"  {'*' if (w, h) == (self.w, self.h) else ' '} {name:<4} {w}x{h}")
+                print("  用法：/ratio 竖图   （预览和正式图要用同一画幅）")
+            elif arg in RATIOS:
+                self.w, self.h = RATIOS[arg]
                 self.show()
             else:
-                print(f"  没有“{arg}”这个风格，/style 查看列表")
+                print(f"  没有“{arg}”这个画幅，/ratio 查看列表")
+        elif cmd in {c: k for k, (c, _, _) in GROUPS.items()}:
+            self.pick({c: k for k, (c, _, _) in GROUPS.items()}[cmd], arg)
+        elif cmd == "/reset":
+            self.sel = {key: None for key in GROUPS}
+            self.neg = ""
+            self.show()
         elif cmd == "/open":
             self.auto_open = arg != "off"
             self.show()
@@ -231,7 +249,10 @@ def main():
     ap.add_argument("--preview", type=int, default=8, help="预览步数")
     ap.add_argument("--final", type=int, default=25, help="正式图步数")
     ap.add_argument("--seed", type=int, default=43)
-    ap.add_argument("--style", choices=list(STYLES), help="风格预设，会追加到每条提示词后")
+    ap.add_argument("--ratio", choices=list(RATIOS), help="画幅预设（覆盖 --size）")
+    for key, (cmd, label, table) in GROUPS.items():
+        ap.add_argument(f"--{key}", choices=list(table), help=f"{label}预设")
+    ap.add_argument("--neg", help="负面提示词：预设名（" + "/".join(NEGATIVES) + "）或自定义文本")
     ap.add_argument("--quant-transformer", action="store_true", help="transformer 也量化为 int8（24GB Mac 用）")
     a = ap.parse_args()
     print("加载模型中（只需一次）...")
