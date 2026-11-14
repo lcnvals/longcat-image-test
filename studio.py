@@ -93,6 +93,7 @@ class Studio:
 
     def generate(self, prompt, steps, seed=None):
         seed = self.seed if seed is None else seed
+        print(f"  生成中：{self.w}x{self.h}，{steps} 步，seed {seed}（算完才有输出，请稍候）...", flush=True)
         t0 = time.time()
         img = self.pipe(
             prompt=None,
