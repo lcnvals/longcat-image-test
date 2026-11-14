@@ -19,6 +19,7 @@
   /light [名称|off] 光线          │ 不带参数 = 列出可选项
   /tone  [名称|off] 色调氛围      │ 选中后自动追加到提示词后
   /time  [名称|off] 时间天气      │ off = 取消
+  /detail [名称|off] 细节质感     │ 可多选，再选一次 = 去掉该项
   /style [名称|off] 风格          ┘
   /neg [预设名|文本|off]  负面提示词：预设（通用/人像/风景/插画）或自定义文本；不带参数列出预设
   /reset           清空所有追加预设和负面提示词
@@ -45,7 +46,7 @@ from diffusers.pipelines.longcat_image.pipeline_longcat_image import prepare_pos
 from optimum.quanto import freeze, qint8, quantize
 from transformers import Qwen2_5_VLForConditionalGeneration
 
-from presets import GROUPS, NEGATIVES, RATIOS
+from presets import GROUPS, MULTI, NEGATIVES, RATIOS
 
 COMMANDS = {
     "/final": "用上一条提示词出正式图",
@@ -56,6 +57,7 @@ COMMANDS = {
     "/light": "光线预设",
     "/tone": "色调氛围预设",
     "/time": "时间天气预设",
+    "/detail": "细节质感预设（可多选）",
     "/style": "风格预设",
     "/neg": "负面提示词",
     "/reset": "清空所有预设",
@@ -188,7 +190,9 @@ class Studio:
         self.cfg = 4.0
         self.neg = NEGATIVES.get(a.neg, a.neg or "")
         self.auto_open = True
-        self.sel = {key: getattr(a, key, None) for key in GROUPS}  # 各分组当前选中的预设名
+        # 各分组当前选中的预设名；多选分组是列表
+        self.sel = {key: (list(getattr(a, key, None) or []) if key in MULTI else getattr(a, key, None))
+                    for key in GROUPS}
         self.last_prompt = None
         self.cache = {}
         os.makedirs(OUT_DIR, exist_ok=True)
@@ -201,7 +205,10 @@ class Studio:
         return self.cache[text]
 
     def compose(self, prompt):
-        parts = [prompt] + [table[self.sel[key]] for key, (_, _, table) in GROUPS.items() if self.sel[key]]
+        parts = [prompt]
+        for key, (_, _, table) in GROUPS.items():
+            names = self.sel[key] if key in MULTI else [self.sel[key]] if self.sel[key] else []
+            parts += [table[n] for n in names]
         return "，".join(parts)
 
     def generate(self, prompt, steps, seed=None):
@@ -234,7 +241,11 @@ class Studio:
     def show(self):
         print(f"  尺寸 {self.w}x{self.h} | 预览 {self.preview_steps} 步 | 正式 {self.final_steps} 步 | "
               f"seed {self.seed} | cfg {self.cfg} | 自动打开 {self.auto_open}")
-        print("  " + " | ".join(f"{label} {self.sel[key] or '-'}" for key, (_, label, _) in GROUPS.items()))
+        def fmt(key):
+            v = self.sel[key]
+            return ("+".join(v) if key in MULTI else v) or "-"
+
+        print("  " + " | ".join(f"{label} {fmt(key)}" for key, (_, label, _) in GROUPS.items()))
         print(f"  负面提示词：{self.neg or '-'}")
         if self.last_prompt:
             print(f"  上一条提示词：{self.last_prompt}")
@@ -244,13 +255,19 @@ class Studio:
         cmd, label, table = GROUPS[key]
         if not arg:
             for name, desc in table.items():
-                print(f"  {'*' if name == self.sel[key] else ' '} {name:<6} {desc}")
+                chosen = name in self.sel[key] if key in MULTI else name == self.sel[key]
+                print(f"  {'*' if chosen else ' '} {name:<6} {desc}")
+            if key in MULTI:
+                print(f"  可多选：再选一次同一项就是取消该项")
             print(f"  用法：{cmd} {next(iter(table))}   取消：{cmd} off")
         elif arg == "off":
-            self.sel[key] = None
+            self.sel[key] = [] if key in MULTI else None
             self.show()
         elif arg in table:
-            self.sel[key] = arg
+            if key in MULTI:
+                self.sel[key] = [n for n in self.sel[key] if n != arg] if arg in self.sel[key] else self.sel[key] + [arg]
+            else:
+                self.sel[key] = arg
             self.show()
         else:
             print(f"  没有“{arg}”这个{label}，{cmd} 查看列表")
@@ -305,7 +322,7 @@ class Studio:
         elif cmd in {c: k for k, (c, _, _) in GROUPS.items()}:
             self.pick({c: k for k, (c, _, _) in GROUPS.items()}[cmd], arg)
         elif cmd == "/reset":
-            self.sel = {key: None for key in GROUPS}
+            self.sel = {key: [] if key in MULTI else None for key in GROUPS}
             self.neg = ""
             self.show()
         elif cmd == "/open":
@@ -352,7 +369,8 @@ def main():
     ap.add_argument("--seed", type=int, default=43)
     ap.add_argument("--ratio", choices=list(RATIOS), help="画幅预设（覆盖 --size）")
     for key, (cmd, label, table) in GROUPS.items():
-        ap.add_argument(f"--{key}", choices=list(table), help=f"{label}预设")
+        ap.add_argument(f"--{key}", choices=list(table), help=f"{label}预设" + ("（可多个）" if key in MULTI else ""),
+                        nargs="+" if key in MULTI else None)
     ap.add_argument("--neg", help="负面提示词：预设名（" + "/".join(NEGATIVES) + "）或自定义文本")
     ap.add_argument("--quant-transformer", action="store_true", help="transformer 也量化为 int8（24GB Mac 用）")
     a = ap.parse_args()
