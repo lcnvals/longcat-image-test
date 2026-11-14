@@ -14,6 +14,7 @@
   /steps N         设预览步数
   /cfg X           设 guidance_scale（默认 4.0）
   /neg 文本         设负面提示词（空 = 清除）
+  /style [名称|off] 查看风格列表 / 选风格（追加到提示词后）/ 取消
   /open on|off     出图后是否自动用"预览"打开
   /show            显示当前设置
   /quit
@@ -34,6 +35,25 @@ from diffusers import LongCatImagePipeline
 from diffusers.pipelines.longcat_image.pipeline_longcat_image import prepare_pos_ids
 from optimum.quanto import freeze, qint8, quantize
 from transformers import Qwen2_5_VLForConditionalGeneration
+
+STYLES = {
+    "写实": "写实摄影风格，自然光线，细节清晰，高清照片质感",
+    "电影": "电影剧照风格，电影级布光，浅景深，宽银幕构图，色彩分级",
+    "胶片": "胶片摄影风格，柔和颗粒感，复古色调，轻微漏光",
+    "人像": "专业人像摄影，柔和侧光，背景虚化，皮肤质感细腻",
+    "动漫": "日系动漫风格，赛璐璐上色，线条干净，色彩明快",
+    "治愈动画": "手绘动画电影风格，温暖柔和的色彩，水彩质感背景，治愈氛围",
+    "3D卡通": "3D 卡通渲染风格，圆润造型，柔和全局光照，色彩饱和",
+    "水彩": "水彩画风格，颜料晕染，纸张纹理，留白，清新淡雅",
+    "油画": "古典油画风格，厚涂笔触，画布纹理，浓郁色彩",
+    "水墨": "中国水墨画风格，墨色浓淡变化，留白意境，宣纸质感",
+    "国潮": "国潮插画风格，中国传统纹样，红金配色，扁平装饰感",
+    "素描": "铅笔素描风格，黑白灰调，排线明暗，素描纸纹理",
+    "扁平插画": "扁平矢量插画风格，简洁几何形状，纯色块，无阴影",
+    "像素": "像素艺术风格，8-bit 复古游戏画面，有限调色板",
+    "赛博朋克": "赛博朋克风格，霓虹灯光，夜晚雨天街道，蓝紫色调，高科技感",
+    "蒸汽波": "蒸汽波美学风格，粉紫渐变，复古未来感，霓虹网格",
+}
 
 MODEL = "./model-t2i"
 OUT_DIR = "./outputs"
@@ -80,6 +100,7 @@ class Studio:
         self.cfg = 4.0
         self.neg = ""
         self.auto_open = True
+        self.style = a.style
         self.last_prompt = None
         self.cache = {}
         os.makedirs(OUT_DIR, exist_ok=True)
@@ -93,6 +114,8 @@ class Studio:
 
     def generate(self, prompt, steps, seed=None):
         seed = self.seed if seed is None else seed
+        if self.style:
+            prompt = f"{prompt}，{STYLES[self.style]}"
         print(f"  生成中：{self.w}x{self.h}，{steps} 步，seed {seed}（算完才有输出，请稍候）...", flush=True)
         t0 = time.time()
         img = self.pipe(
@@ -119,7 +142,8 @@ class Studio:
 
     def show(self):
         print(f"  尺寸 {self.w}x{self.h} | 预览 {self.preview_steps} 步 | 正式 {self.final_steps} 步 | "
-              f"seed {self.seed} | cfg {self.cfg} | neg {self.neg!r} | 自动打开 {self.auto_open}")
+              f"seed {self.seed} | cfg {self.cfg} | 风格 {self.style or '无'} | neg {self.neg!r} | "
+              f"自动打开 {self.auto_open}")
         if self.last_prompt:
             print(f"  上一条提示词：{self.last_prompt}")
 
@@ -155,6 +179,19 @@ class Studio:
         elif cmd == "/neg":
             self.neg = arg
             self.show()
+        elif cmd == "/style":
+            if not arg:
+                for name, desc in STYLES.items():
+                    print(f"  {'*' if name == self.style else ' '} {name:<6} {desc}")
+                print("  用法：/style 动漫   取消：/style off")
+            elif arg == "off":
+                self.style = None
+                self.show()
+            elif arg in STYLES:
+                self.style = arg
+                self.show()
+            else:
+                print(f"  没有“{arg}”这个风格，/style 查看列表")
         elif cmd == "/open":
             self.auto_open = arg != "off"
             self.show()
@@ -194,6 +231,7 @@ def main():
     ap.add_argument("--preview", type=int, default=8, help="预览步数")
     ap.add_argument("--final", type=int, default=25, help="正式图步数")
     ap.add_argument("--seed", type=int, default=43)
+    ap.add_argument("--style", choices=list(STYLES), help="风格预设，会追加到每条提示词后")
     ap.add_argument("--quant-transformer", action="store_true", help="transformer 也量化为 int8（24GB Mac 用）")
     a = ap.parse_args()
     print("加载模型中（只需一次）...")
