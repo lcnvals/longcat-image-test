@@ -32,8 +32,10 @@ import os
 import subprocess
 import time
 
+import sys
+
 try:
-    import readline  # noqa: F401  让输入支持方向键和历史
+    import readline  # noqa: F401  没有 prompt_toolkit 时的退路：方向键和历史
 except ImportError:
     pass
 
@@ -44,6 +46,102 @@ from optimum.quanto import freeze, qint8, quantize
 from transformers import Qwen2_5_VLForConditionalGeneration
 
 from presets import GROUPS, NEGATIVES, RATIOS
+
+COMMANDS = {
+    "/final": "用上一条提示词出正式图",
+    "/batch": "换 N 个种子各出一张预览",
+    "/seed": "设种子（+ 表示加 1）",
+    "/ratio": "画幅预设",
+    "/shot": "镜头构图预设",
+    "/light": "光线预设",
+    "/tone": "色调氛围预设",
+    "/time": "时间天气预设",
+    "/style": "风格预设",
+    "/neg": "负面提示词",
+    "/reset": "清空所有预设",
+    "/size": "自定义尺寸 WxH",
+    "/steps": "预览步数",
+    "/cfg": "guidance_scale",
+    "/open": "出图后自动打开 on/off",
+    "/show": "查看设置和实际提示词",
+    "/help": "帮助",
+    "/quit": "退出",
+}
+
+
+def arg_choices(cmd):
+    """命令参数的候选项：[(值, 说明)]"""
+    for key, (c, _, table) in GROUPS.items():
+        if c == cmd:
+            return list(table.items()) + [("off", "取消")]
+    if cmd == "/ratio":
+        return [(n, f"{w}x{h}") for n, (w, h) in RATIOS.items()]
+    if cmd == "/neg":
+        return list(NEGATIVES.items()) + [("off", "清除")]
+    if cmd == "/open":
+        return [("on", "自动打开"), ("off", "不打开")]
+    if cmd == "/seed":
+        return [("+", "种子加 1")]
+    return []
+
+
+def make_prompt_session():
+    """有 TTY 且装了 prompt_toolkit 时返回带补全菜单的输入函数，否则返回 None。"""
+    if not sys.stdin.isatty():
+        return None
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.completion import Completer, Completion
+        from prompt_toolkit.history import FileHistory
+    except ImportError:
+        return None
+
+    class StudioCompleter(Completer):
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            if not text.startswith("/"):
+                return
+            if " " not in text:  # 补命令
+                for cmd, desc in COMMANDS.items():
+                    if cmd.startswith(text):
+                        yield Completion(cmd + " ", start_position=-len(text), display=cmd, display_meta=desc)
+                return
+            cmd, _, arg = text.partition(" ")
+            for value, desc in arg_choices(cmd):
+                if value.startswith(arg.strip()):
+                    yield Completion(value, start_position=-len(arg), display_meta=desc)
+
+    from prompt_toolkit.filters import completion_is_selected
+    from prompt_toolkit.key_binding import KeyBindings
+
+    kb = KeyBindings()
+
+    @kb.add("enter", filter=completion_is_selected)
+    def _(event):
+        # 菜单里选中的是命令（以空格结尾）：只填入，等参数；选中的是参数：填入并执行
+        buf = event.current_buffer
+        completion = buf.complete_state.current_completion
+        buf.apply_completion(completion)
+        if not completion.text.endswith(" "):
+            buf.validate_and_handle()
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    session = PromptSession(
+        completer=StudioCompleter(),
+        complete_while_typing=True,
+        key_bindings=kb,
+        history=FileHistory(os.path.join(OUT_DIR, ".history")),
+    )
+
+    # 选中 "/style " 这类命令后，立刻弹出它的参数菜单
+    def on_change(buf):
+        cmd, sep, arg = buf.text.partition(" ")
+        if sep and not arg and arg_choices(cmd) and not buf.complete_state:
+            buf.start_completion(select_first=False)
+
+    session.default_buffer.on_text_changed += on_change
+    return lambda: session.prompt("\nlongcat> ")
+
 
 MODEL = "./model-t2i"
 OUT_DIR = "./outputs"
@@ -222,10 +320,13 @@ class Studio:
 
     def loop(self):
         self.show()
-        print("  直接输入提示词出预览图；/help 查看命令；/quit 退出")
+        read = make_prompt_session()
+        tip = "输入 / 弹出命令菜单，方向键选择、Tab/回车确认；" if read else ""
+        print(f"  直接输入提示词出预览图；{tip}/help 查看命令；/quit 退出")
+        read = read or (lambda: input("\nlongcat> "))
         while True:
             try:
-                line = input("\nlongcat> ").strip()
+                line = read().strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 break

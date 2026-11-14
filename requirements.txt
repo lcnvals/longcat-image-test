@@ -2,6 +2,7 @@ accelerate==1.15.0
 huggingface_hub==2.4.0
 modelscope==1.40.3
 optimum-quanto==0.2.7
+prompt_toolkit==3.0.53
 pillow==13.0.0
 safetensors==0.8.0
 torch==2.15.0
