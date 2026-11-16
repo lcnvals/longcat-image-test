@@ -60,5 +60,10 @@
   },
   "skills": [
     "蓝焰斩"
-  ]
+  ],
+  "loadout_images": {
+    "便装": [
+      "front@便装.png"
+    ]
+  }
 }

@@ -7,10 +7,12 @@
   "avoid": [],
   "style": "游戏CG",
   "seed": 42,
-  "images": [],
+  "images": [
+    "front.png"
+  ],
   "sheets": {
     "front": {
-      "prompt": "饰品设定图，正面特写完整展示，纯浅灰色背景",
+      "prompt": "产品展示照，单件饰品平放在浅灰色台面上，居中特写，完整展示形状和材质",
       "size": "1024x1024"
     }
   }

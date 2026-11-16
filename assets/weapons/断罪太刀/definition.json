@@ -7,7 +7,10 @@
   "avoid": [],
   "style": "游戏CG",
   "seed": 42,
-  "images": [],
+  "images": [
+    "full.png",
+    "detail.png"
+  ],
   "sheets": {
     "full": {
       "prompt": "武器设定图，横向完整展示整把武器，纯浅灰色背景，没有人物",
