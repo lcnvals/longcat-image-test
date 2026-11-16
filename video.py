@@ -574,6 +574,14 @@ def edit_concat(items, out, edit, settings=None, base=None):
         length = (b - a) / speed
         vf = [f"trim=start={a}:end={b}", f"setpts=(PTS-STARTPTS)/{speed}", f"fps={fps}",
               f"scale={tw}:{th}:force_original_aspect_ratio=increase", f"crop={tw}:{th}", "setsar=1"]
+        if job.get("line") and job.get("mode") != "still":
+            # 台词比画面长：最后一帧定格到念完，避免台词被下一镜或片尾截断
+            import postprod
+            _, dur = postprod.tts(job["line"], os.path.join(base or tmp, "audio"), postprod.voice_cfg(job), job.get("voice"))
+            hold = dur + 0.4 - length
+            if hold > 0.05:
+                vf.append(f"tpad=stop_mode=clone:stop_duration={hold:.2f}")
+                length += hold
         fin = job.get("in", "cut")
         if idx == 0 and edit.get("fade_in"):
             fin = "fade"
