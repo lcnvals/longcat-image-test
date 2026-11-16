@@ -507,6 +507,10 @@ class Studio:
                 if line.startswith("/"):
                     self.command(line)
                 else:
+                    from prompttools import clean_prompt
+                    line, removed = clean_prompt(line)  # 粘贴来的提示词：去掉其他工具的专用语法
+                    if removed:
+                        print(f"  已去掉本工具不认识的语法：{'、'.join(removed)}")
                     self.last_prompt = line
                     self.generate(line, self.preview_steps)
             except Exception as e:  # 单次出错不退出常驻进程

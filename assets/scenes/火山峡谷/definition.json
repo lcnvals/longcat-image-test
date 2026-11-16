@@ -6,7 +6,10 @@
   "avoid": [],
   "style": "游戏CG",
   "seed": 42,
-  "images": [],
+  "images": [
+    "wide.png",
+    "mid.png"
+  ],
   "sheets": {
     "wide": {
       "prompt": "场景设定图，空镜远景，画面中没有任何人物和怪物",

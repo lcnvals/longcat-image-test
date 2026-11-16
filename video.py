@@ -15,6 +15,8 @@
   .venv-mlx/bin/python video.py board projects/猫咖啡店/storyboard.json --only S03  # 只重做 S03
   .venv-mlx/bin/python video.py board projects/猫咖啡店/storyboard.json --concat    # 拼接成片
   .venv-mlx/bin/python video.py init projects/猫咖啡店                             # 生成分镜模板
+  .venv-mlx/bin/python video.py import-prompts 提示词.txt projects/猫咖啡店         # 每行一个镜头的文本 → 分镜
+      文本格式：镜号 | 画面（出关键帧） | 动作（出视频） | 运镜 | 其他参数 key=value
 
 局部修改已有视频（任何 video.py 生成的视频都可以，包括分镜里的镜头）：
   .venv-mlx/bin/python video.py retake 视频.mp4 --from 0.8 --to 1.6 -p "猫转头看向镜头"   # 只重做这一段
@@ -632,6 +634,61 @@ def edit_concat(items, out, edit, settings=None, base=None):
     print(f"成片 -> {out}（{total:.1f} 秒）")
 
 
+def import_prompts(txt, project_dir, clean=True, replace=False):
+    """把“每行一个镜头”的提示词文本导入成分镜（新建或按镜号合并）。"""
+    from prompttools import clean_prompt, parse_shot_lines
+    with open(txt, encoding="utf-8") as f:
+        shots = parse_shot_lines(f.read())
+    if not shots:
+        raise SystemExit(f"{txt} 里没有解析到镜头。格式：镜号 | 画面 | 动作 | 运镜 | key=value")
+    notes = []
+    for shot in shots:
+        line = shot.pop("_line")
+        if clean:
+            for key in ("keyframe", "prompt"):
+                if shot.get(key):
+                    shot[key], removed = clean_prompt(shot[key])
+                    if removed:
+                        notes.append(f"  第 {line} 行 {shot['id']} {key}：去掉了 {'、'.join(removed)}")
+        cam = shot.get("camera")
+        if cam and cam not in CAMERAS:  # 不是预设的运镜：并进动作描述里，避免生成时报错
+            shot["prompt"] = "，".join(x for x in (shot.get("prompt"), cam) if x)
+            shot.pop("camera")
+            notes.append(f"  第 {line} 行 {shot['id']}：运镜“{cam}”不是预设（{'、'.join(CAMERAS)}），已并入动作描述")
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, "storyboard.json")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            board = json.load(f)
+    else:
+        board = {"settings": {"ratio": "横屏", "fps": 25, "seconds": 2, "seeds": [42],
+                              "keyframe_model": "z-image-turbo", "keyframe_size": "1152x768"}, "shots": []}
+    if replace:
+        board["shots"] = []
+    existing = {x["id"]: x for x in board["shots"]}
+    added = updated = 0
+    for shot in shots:
+        if shot["id"] in existing:
+            existing[shot["id"]].update(shot)  # 合并：保留文本里没写的已有字段（如 pick、剪辑参数）
+            updated += 1
+        else:
+            board["shots"].append(shot)
+            added += 1
+    board["shots"].sort(key=lambda x: x.get("id", ""))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(board, f, ensure_ascii=False, indent=2)
+    print(f"分镜 -> {os.path.relpath(path, HERE)}：新增 {added} 个镜头，更新 {updated} 个，共 {len(board['shots'])} 个")
+    if notes:
+        print("清理与提示：\n" + "\n".join(notes))
+    for shot in shots:
+        kind = "漫剧" if shot.get("mode") == "still" else "视频"
+        print(f"  {shot['id']} [{kind}] 画面：{(shot.get('keyframe') or '-')[:30]} | 动作：{(shot.get('prompt') or '-')[:20]}"
+              f" | 运镜：{shot.get('camera') or '-'}")
+    rel = os.path.relpath(path, HERE)
+    print(f"下一步：\n  .venv-mlx/bin/python video.py keyframes {rel}     # 批量出关键帧\n"
+          f"  .venv-mlx/bin/python video.py board {rel} --concat  # 生成视频并拼接")
+
+
 def concat(clips, out):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -965,6 +1022,12 @@ def main():
     k.add_argument("--seed", dest="seeds", type=int, nargs="+", help="覆盖种子；多个种子都会出图，第一个作为当前关键帧")
     k.add_argument("--force", action="store_true", help="已有关键帧也重新生成")
     k.add_argument("--no-refs", dest="use_refs", action="store_false", help="不用定义里的设定图做参考，只用文字")
+    ip = sub.add_parser("import-prompts", help="把每行一个镜头的提示词文本导入成分镜")
+    ip.add_argument("textfile")
+    ip.add_argument("project_dir")
+    ip.add_argument("--no-clean", dest="clean", action="store_false",
+                    help="不清理 Midjourney 参数、WebUI 权重括号、LoRA 标签等专用语法")
+    ip.add_argument("--replace", action="store_true", help="清空原有镜头再导入（默认按镜号合并）")
     sub.add_parser("assist", help="参数助手：交互菜单熟悉各项参数")
     i = sub.add_parser("init", help="在目录里生成分镜模板")
     i.add_argument("project_dir")
@@ -980,6 +1043,9 @@ def main():
         print(f"分镜模板 -> {path}")
         return
 
+    if a.cmd == "import-prompts":
+        import_prompts(a.textfile, a.project_dir, a.clean, a.replace)
+        return
     if a.cmd == "keyframes":
         gen_keyframes(a.storyboard, a.only, a.model, a.quantize, a.seeds, a.force, a.use_refs)
         return
