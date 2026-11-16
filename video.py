@@ -1,4 +1,5 @@
-"""本地视频生成（LTX-2.3，MLX）。和 studio.py 共用预设与 AI 提示词工具，单独运行。
+"""本地视频生成。Mac 上用 LTX-2.3（MLX），Linux + NVIDIA 上用 LTX-2（diffusers，见 video_cuda.py）。
+和 studio.py 共用预设与 AI 提示词工具，单独运行。
 
 视频模型很吃内存（24GB 机器上约 15GB），不和生图模型同时加载：先用 studio 出关键帧，
 退出后再用本工具生成视频。LTX 装在自己的虚拟环境里，这里通过子进程调用（路径见 video.json）。
@@ -53,10 +54,14 @@ def load_cfg():
                         cfg.setdefault(k, {}).update(v)
                     elif not k.startswith("_"):
                         cfg[k] = v
-    ltx = cfg.get("ltx", {})
-    for k in ("cli", "model", "gemma"):
-        if k in ltx and not os.path.isabs(ltx[k]):
-            ltx[k] = os.path.normpath(os.path.join(HERE, ltx[k]))
+    for section in ("ltx", "cuda"):
+        conf = cfg.get(section, {})
+        for k in ("cli", "model", "gemma", "python"):
+            if k in conf and not os.path.isabs(conf[k]) and ("/" in conf[k] or conf[k].startswith(".")):
+                conf[k] = os.path.normpath(os.path.join(HERE, conf[k]))
+    # 后端：Mac 默认 mlx（ltx-2-mlx），其他平台默认 cuda（video_cuda.py）
+    import platform
+    cfg["backend"] = cfg.get("backend") or ("mlx" if platform.system() == "Darwin" else "cuda")
     return cfg
 
 
@@ -141,7 +146,31 @@ def file_sha1(path):
 
 # ---------------- 生成 ----------------
 
+def cuda_command(cfg, job, prompt, seed, w, h, frames, out):
+    """Linux + NVIDIA：调用 video_cuda.py（LTX-2，diffusers）。"""
+    c = cfg.get("cuda", {})
+    model = c.get("model", os.path.join(HERE, "models", "ltx-2"))
+    if not os.path.isdir(model):
+        raise SystemExit(f"找不到 LTX-2 模型目录：{model}。先运行 deploy/setup_cuda.sh 下载")
+    if job.get("_end_image"):
+        print("  注意：CUDA 后端暂不支持尾帧锁定，--end-image 会被忽略")
+    cmd = [c.get("python", sys.executable), os.path.join(HERE, "video_cuda.py"), "-p", prompt, "-o", out,
+           "-W", str(w), "-H", str(h), "-f", str(frames), "--fps", str(job.get("fps", DEFAULTS["fps"])),
+           "--seed", str(seed), "--model", model, "--steps", str(c.get("steps", 30)),
+           "--guidance", str(c.get("guidance", 3.0)), "--offload", c.get("offload", "auto")]
+    if job.get("_image"):
+        cmd += ["--image", job["_image"]]
+    neg = NEGATIVES.get(job.get("neg"), job.get("neg"))
+    if neg:
+        cmd += ["--negative", neg]
+    if job.get("audio", DEFAULTS["audio"]):
+        cmd.append("--audio")
+    return cmd
+
+
 def ltx_command(cfg, job, prompt, seed, w, h, frames, out):
+    if cfg.get("backend") == "cuda":
+        return cuda_command(cfg, job, prompt, seed, w, h, frames, out)
     ltx = cfg.get("ltx", {})
     for k in ("cli", "model", "gemma"):
         if not os.path.exists(ltx.get(k, "")):
@@ -243,6 +272,8 @@ def latent_range_seconds(start, end, fps):
 
 
 def edit_job(cfg, a, kind):
+    if cfg.get("backend") == "cuda":
+        raise SystemExit(f"{kind} 目前只支持 Mac 上的 LTX-2.3（ltx-2-mlx）；CUDA 后端可以用 --only 重做整个镜头")
     video = a.video
     if not os.path.exists(video):
         raise SystemExit(f"找不到视频：{video}")
@@ -341,7 +372,11 @@ def load_board(path):
 def concat(clips, out):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise SystemExit("没有找到 ffmpeg，先 brew install ffmpeg")
+        try:  # 云服务器上常没有系统 ffmpeg，用 imageio-ffmpeg 自带的版本
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError:
+            raise SystemExit("没有找到 ffmpeg：Mac 用 brew install ffmpeg，Linux 用 apt install -y ffmpeg")
     lst = out[:-4] + "_list.txt"
     with open(lst, "w", encoding="utf-8") as f:
         for c in clips:

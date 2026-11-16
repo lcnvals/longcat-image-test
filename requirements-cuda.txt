@@ -1,0 +1,16 @@
+# Linux + NVIDIA（CUDA）环境。torch 用 PyPI 默认的 Linux 版本（自带 CUDA 运行库）。
+torch
+torchvision
+diffusers @ git+https://github.com/huggingface/diffusers@43e30028af5120d8b0868cb6975b9fad39cc4fab
+transformers==5.23.0
+accelerate==1.15.0
+safetensors==0.8.0
+optimum-quanto==0.2.7
+sentencepiece
+pillow
+imageio
+imageio-ffmpeg
+av
+modelscope
+huggingface_hub
+prompt_toolkit==3.0.53

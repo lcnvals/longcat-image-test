@@ -1,5 +1,13 @@
 {
   "_说明": "视频后端配置。本机路径不同就新建 video.local.json 覆盖同名项（不进仓库）。",
+  "_backend": "不写 backend 时自动选择：Mac 用 mlx（ltx 段），Linux 用 cuda（cuda 段）",
+  "cuda": {
+    "python": "./.venv-cuda/bin/python",
+    "model": "./models/ltx-2",
+    "steps": 30,
+    "guidance": 3.0,
+    "offload": "auto"
+  },
   "ltx": {
     "cli": "./video-lab/ltx-mlx/bin/ltx-2-mlx",
     "model": "./video-lab/ltx-model",

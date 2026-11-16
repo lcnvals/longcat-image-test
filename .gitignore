@@ -11,3 +11,4 @@ ai.local.json
 models/
 video.local.json
 projects/
+.venv-cuda/

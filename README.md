@@ -13,6 +13,7 @@ LongCat 的官方示例针对 CUDA，并用 `enable_model_cpu_offload()` 节省�
 | `menu.py` | 命令补全菜单（studio 和视频参数助手共用） | — |
 | `backends.py` | 模型后端：longcat（PyTorch）、z-image-turbo、flux2-klein-4b（mflux/MLX） | 三个都实测过 |
 | `video.py`、`video.json` | 本地视频生成（LTX-2.3）：单镜头和分镜批量，图生视频、运镜预设、拼接成片 | 实测过（video 分支） |
+| `deploy/setup_cuda.sh`、`video_cuda.py` | Linux + NVIDIA 一键部署与 CUDA 视频运行器 | 未在真实 GPU 上测试 |
 | `ai.py`、`ai.json` | AI 提示词工具：调用 OpenAI 兼容接口扩写、翻译、看图反推等，可自定义 | 用模拟接口测过，真实接口未测 |
 
 ## 模型选择（M1 Pro 32GB 实测）
@@ -288,10 +289,12 @@ git -C ltx-2-mlx checkout 895201df379b079c2154738bcf92005b7a371923   # 24GB 实�
 python3 -m venv ltx-mlx
 ltx-mlx/bin/pip install -e ltx-2-mlx/packages/ltx-core-mlx -e ltx-2-mlx/packages/ltx-pipelines-mlx av imageio-ffmpeg psutil
 # 模型约 20.5GB（HF），文本编码器 Gemma 约 8GB（魔搭）
-hf download dgrauet/ltx-2.3-mlx-q4 --include "*.json" "connector.safetensors" \
-  "transformer-distilled-1.1.safetensors" "spatial_upscaler_x2_v1_1.safetensors" \
-  "vae_decoder.safetensors" "vae_encoder.safetensors" \
-  "audio_vae.safetensors" "vocoder.safetensors" --local-dir ltx-model   # retake/extend 必须要音频解码器
+# hf 的 --include 每次只接一个模式，多个模式要各写一个（否则多余的会被当成文件名，.json 会漏下）
+# audio_vae / vocoder 是 retake、extend 必需的音频解码器
+hf download dgrauet/ltx-2.3-mlx-q4 --include "*.json" --include "connector.safetensors" \
+  --include "transformer-distilled-1.1.safetensors" --include "spatial_upscaler_x2_v1_1.safetensors" \
+  --include "vae_decoder.safetensors" --include "vae_encoder.safetensors" \
+  --include "audio_vae.safetensors" --include "vocoder.safetensors" --local-dir ltx-model
 modelscope download --model mlx-community/gemma-3-12b-it-4bit --local-dir gemma
 ```
 
@@ -405,6 +408,58 @@ video> /gen                  ← 按当前参数生成
 - 资料显示 LTX-2.3 超过约 2 秒（97 帧以上）成功率明显下降，所以建议每个镜头 2 秒左右，靠分镜拼接成长视频。
 - 24GB M4 Pro 上的公开实测：768×512、49 帧约 110–130 秒，峰值 14.6GB。基础版 M4 没有实测数据。
 - 许可：LTX-2 社区许可，年收入 1000 万美元以下可免费商用。
+
+## 在 NVIDIA 云服务器上部署（实验中）
+
+Mac 上生成视频很慢（M1 Pro 上 2 秒视频约 3 分钟）。可以在 Mac 上调好分镜和关键帧，把视频这类批量任务交给云上的 NVIDIA GPU。
+
+> 作者没有 NVIDIA 机器，以下脚本和 CUDA 代码**尚未在真实服务器上测试**。遇到问题请把脚本输出发回来。
+
+### 选什么卡
+
+| 用途 | 显存 | 说明 |
+|---|---|---|
+| 只生图（Z-Image、FLUX.2、LongCat） | 24GB（如 RTX 4090）就够 | |
+| 生成视频（LTX-2，19B） | **建议 48GB 以上**（L40S、A6000、A100、H100） | transformer 光权重就要约 38GB；24GB 卡只能逐层搬运，会非常慢 |
+
+内存建议 64GB 以上；磁盘按模型大小准备：Z-Image 约 33GB、FLUX.2 klein 约 16GB、LongCat 约 30GB、LTX-2 约 95GB。
+
+### 一键部署
+
+```bash
+git clone https://github.com/lcnvals/longcat-image-test.git && cd longcat-image-test
+bash deploy/setup_cuda.sh                    # 默认装 Z-Image-Turbo + LTX-2，从魔搭下载
+bash deploy/setup_cuda.sh --pip-mirror       # 国内服务器：pip 用清华镜像
+bash deploy/setup_cuda.sh --source hf        # 海外服务器：从 Hugging Face 下载
+bash deploy/setup_cuda.sh --models z-image-turbo,flux2-klein-4b,longcat,ltx-2   # 自选模型
+bash deploy/setup_cuda.sh --check            # 只做环境检查和自检
+```
+
+脚本分四步：环境检查（GPU、显存、内存、磁盘、Python）→ 安装依赖到 `.venv-cuda` → 下载模型 → 自检（CUDA、diffusers 管线、模型、ffmpeg）。可以重复运行，已完成的部分会跳过，下载支持断点续传。
+
+### 使用
+
+命令和 Mac 上一样，只是换成 `.venv-cuda` 里的 Python，模型名不变（在 Linux 上自动选用 CUDA 实现）：
+
+```bash
+.venv-cuda/bin/python studio.py --model z-image-turbo
+.venv-cuda/bin/python video.py gen "一只橘猫坐在窗台上，慢慢转头看向窗外" --ratio 小横屏
+.venv-cuda/bin/python video.py board projects/<片名>/storyboard.json --concat
+```
+
+推荐流程：在 Mac 上用 studio 和 `video.py keyframes` 准备好 `projects/<片名>/`（分镜 + 关键帧），整个目录上传到服务器，跑 `video.py board ... --concat`，再把成片下载回来。
+
+### 和 Mac 版的区别
+
+| | Mac（LTX-2.3 蒸馏版，MLX） | NVIDIA（LTX-2，diffusers） |
+|---|---|---|
+| 模型 | LTX-2.3 22B 蒸馏，4-bit | LTX-2 19B，bf16，30 步，带 CFG |
+| 负面提示词 | 通过 NAG 生效 | 原生支持 |
+| 尾帧锁定 `--end-image` | 支持 | 暂不支持（会忽略） |
+| `retake` / `extend` | 支持 | 暂不支持，可以用 `--only` 重做整个镜头 |
+| 显存策略 | 低内存模式 | 自动：≥80GB 全部放显存，≥40GB 按组件搬运，更小逐层搬运 |
+
+后端在 `video.json` 的 `cuda` 段配置（模型路径、步数、guidance、显存策略），也可以设置 `"backend": "mlx"` 或 `"cuda"` 强制指定。
 
 ## 实测速度（M1 Pro 32GB）
 
