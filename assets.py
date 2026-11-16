@@ -34,14 +34,21 @@ ROOT = os.path.join(HERE, "assets")
 KINDS = {  # 类别 -> 目录
     "character": "characters", "monster": "monsters",
     "weapon": "weapons", "armor": "armors", "outfit": "outfits", "accessory": "accessories",
-    "mount": "mounts", "skill": "skills", "prop": "props",
+    "mount": "mounts", "pet": "pets", "skill": "skills", "prop": "props",
     "world": "worlds", "region": "regions", "scene": "scenes",
 }
 KIND_LABEL = {"character": "人物", "monster": "怪物", "weapon": "武器", "armor": "护甲", "outfit": "服饰",
-              "accessory": "饰品", "mount": "坐骑", "skill": "技能", "prop": "道具",
+              "accessory": "饰品", "mount": "坐骑", "pet": "宠物", "skill": "技能", "prop": "道具",
               "world": "世界观", "region": "区域", "scene": "地点"}
-ITEM_KINDS = ("weapon", "armor", "outfit", "accessory", "prop")
-DEFAULT_ITEM_SLOT = {"weapon": "主手", "armor": "护甲", "outfit": "上衣", "accessory": "头饰", "prop": "副手"}
+ITEM_KINDS = ("weapon", "armor", "outfit", "accessory", "prop", "mount", "pet")
+DEFAULT_ITEM_SLOT = {"weapon": "主手", "armor": "护甲", "outfit": "上衣", "accessory": "头饰", "prop": "副手",
+                     "mount": "坐骑", "pet": "宠物"}
+
+# 品质 / 强化：自动追加的光效描述（参考网游的品质颜色）
+QUALITY = {"普通": "", "优秀": "表面泛着淡淡的光泽", "稀有": "隐约泛着蓝色微光", "史诗": "环绕着紫色流光",
+           "传说": "散发金色光芒，周身环绕流光粒子"}
+
+DIRS = {"北": 0, "东北": 45, "东": 90, "东南": 135, "南": 180, "西南": 225, "西": 270, "西北": 315}
 
 # 默认栏位（按描述拼接的顺序）。template 里的 {} 换成单品描述；excludes 是互斥的栏位。
 DEFAULT_SLOTS = [
@@ -64,6 +71,7 @@ DEFAULT_SLOTS = [
     {"slot": "主手", "group": "战斗", "template": "手持{}"},
     {"slot": "副手", "group": "战斗", "template": "另一只手拿着{}"},
     {"slot": "坐骑", "group": "战斗", "template": "骑着{}"},
+    {"slot": "宠物", "group": "战斗", "template": "身边跟着{}"},
 ]
 
 # 各类别默认生成的设定图：文件名 -> (画面要求, 尺寸)
@@ -87,6 +95,7 @@ DEFAULT_SHEETS = {
     "outfit": {"front": ("服装设定图，穿在无脸人台上的正面完整展示，纯浅灰色背景", "768x1152")},
     "accessory": {"front": ("饰品设定图，正面特写完整展示，纯浅灰色背景", "1024x1024")},
     "mount": {"side": ("坐骑设定图，侧面全身完整入镜，纯浅灰色背景", "1152x768")},
+    "pet": {"front": ("宠物设定图，正面全身完整入镜，纯浅灰色背景", "1024x1024")},
     "skill": {"effect": ("技能特效概念图，深色背景上展示特效的形态和颜色，没有人物", "1152x768")},
     "prop": {"front": ("道具设定图，正面完整展示，纯浅灰色背景", "1024x1024")},
     "world": {"key": ("世界观概念图，宏大的远景，展示整体风格与氛围，没有人物", "1152x768")},
@@ -185,7 +194,7 @@ def equipped(data, loadout=None):
         if loadout not in sets:
             raise SystemExit(f"{data['name']} 没有套装“{loadout}”，已有：{'、'.join(sets) or '无'}")
         slots.update(sets[loadout])
-    slots = {k: v for k, v in slots.items() if v and v != "-"}
+    slots = {k: v for k, v in slots.items() if item_name(v) and item_name(v) != "-"}
     for s in slot_table():
         if s["slot"] in slots:
             for ex in s.get("excludes", []):
@@ -193,21 +202,60 @@ def equipped(data, loadout=None):
     return slots
 
 
+def item_name(value):
+    """栏位的值可以是字符串，或 {"item": 名字/描述, "dye": 染色, "quality": 品质, "refine": 强化等级}"""
+    return value.get("item") if isinstance(value, dict) else value
+
+
 def item_text(value):
-    """栏位的值：已有定义就用定义的描述，否则当作直接写的描述。"""
-    data, _ = find(value)
-    return _plain(data) if data else value
+    """栏位的值 -> 描述。已有定义就用定义的描述（再套染色、品质、强化），否则当作直接写的描述。"""
+    opts = value if isinstance(value, dict) else {}
+    name = item_name(value)
+    data, _ = find(name)
+    text = _plain(data) if data else name
+    dye = opts.get("dye")
+    if dye:
+        dye = ((data or {}).get("dyes") or {}).get(dye, dye)  # 定义里可以给染色起别名，如 黑金 -> 黑色与金色
+        base_color = (data or {}).get("color")
+        if base_color and base_color in text:
+            text = text.replace(base_color, dye)          # 替换原始颜色
+        else:
+            text += f"，整体是{dye}配色"
+    glow = QUALITY.get(opts.get("quality") or (data or {}).get("quality") or "", "")
+    refine = int(opts.get("refine") or 0)
+    if refine >= 10:
+        glow = "，".join(x for x in (glow, "光效极为强烈耀眼") if x)
+    elif refine >= 5:
+        glow = "，".join(x for x in (glow, "光效明显") if x)
+    return "，".join(x for x in (text, glow) if x)
 
 
-def describe(data, loadout=None, variant=None):
-    """用于提示词的完整文字。人物：本体 + 各栏位；地点：世界观 + 区域 + 地点 + 变体；其他：描述 + 必须特征。"""
+def phase_text(data, phase=None):
+    """怪物（或人物觉醒等）阶段的描述 + 弱点（在 show 指定的阶段显露，"always" 表示一直可见）。"""
+    parts = []
+    if phase:
+        phases = data.get("phases") or {}
+        if phase not in phases:
+            raise SystemExit(f"{data['name']} 没有阶段“{phase}”，已有：{'、'.join(phases) or '无'}")
+        parts.append(phases[phase])
+    weak = data.get("weakness")
+    if weak:
+        show = weak.get("show", "always")
+        if show == "always" or (phase and phase in show):
+            parts.append(weak.get("desc", ""))
+    return "，".join(p for p in parts if p)
+
+
+def describe(data, loadout=None, variant=None, phase=None):
+    """用于提示词的完整文字。人物：本体 + 各栏位（+ 阶段/弱点）；地点：世界观 + 区域 + 地点 + 变体；其他：描述。"""
     kind = data.get("kind")
-    if kind in ("character", "monster") and data.get("slots"):
+    if kind in ("character", "monster"):
         parts = [_plain(data)]
-        worn = equipped(data, loadout)
+        worn = equipped(data, loadout) if data.get("slots") or loadout else {}
         for s in slot_table():
             if s["slot"] in worn:
                 parts.append(s.get("template", "{}").format(item_text(worn[s["slot"]])))
+        parts.append(phase_text(data, phase))
         return "，".join(p for p in parts if p)
     if kind == "scene":
         chain, cur = [], data
@@ -228,7 +276,7 @@ def gear_images(data, loadout=None):
     out = []
     worn = equipped(data, loadout)
     for s in slot_table():
-        name = worn.get(s["slot"])
+        name = item_name(worn.get(s["slot"]))
         if name:
             item, d = find(name)
             if item:
@@ -238,11 +286,15 @@ def gear_images(data, loadout=None):
     return out
 
 
-def resolve_entry(name, loadout=None, variant=None):
+def resolve_entry(name, loadout=None, variant=None, phase=None):
     """单个 cast 条目 -> (描述文字, 参考图[本体在前、装备在后], 音色信息)"""
     data, d = load(name)
-    text = describe(data, loadout, variant)
+    text = describe(data, loadout, variant, phase)
     own = images(data, d, variant)
+    if phase:  # 阶段有自己的设定图时优先用（assets.py sheet 名字 --phase 阶段）
+        ph = [os.path.join(d, f) for f in (data.get("phase_images") or {}).get(phase, [])
+              if os.path.exists(os.path.join(d, f))]
+        own = ph or own
     if loadout:  # 换装时优先用这套装的设定图（assets.py sheet 名字 --loadout 套装 生成），避免被默认造型带偏
         lo_imgs = [os.path.join(d, f) for f in (data.get("loadout_images") or {}).get(loadout, [])
                    if os.path.exists(os.path.join(d, f))]
@@ -251,11 +303,12 @@ def resolve_entry(name, loadout=None, variant=None):
         else:
             own = []  # 没有套装设定图时不用默认造型的图做参考，只靠文字描述 + 单品图
     refs = own + (gear_images(data, loadout) if data.get("slots") else [])
-    voice = {"name": data.get("display_name") or data["name"], "voice": data.get("voice")}
+    voice = {"name": data.get("display_name") or data["name"], "voice": data.get("voice"),
+             "layout": data.get("layout") if data.get("kind") == "scene" else None}
     return text, refs, voice
 
 
-def resolve_cast(cast, with_voice=False, loadouts=None, variants=None):
+def resolve_cast(cast, with_voice=False, loadouts=None, variants=None, phases=None):
     """分镜的 cast -> ({键: 描述}, {键: 参考图}[, {键: 音色}])。
 
     cast 的值可以是名字，或 {"name": 名字, "loadout": 套装, "variant": 变体}；
@@ -264,13 +317,57 @@ def resolve_cast(cast, with_voice=False, loadouts=None, variants=None):
     texts, refs, voices = {}, {}, {}
     for key, entry in (cast or {}).items():
         if isinstance(entry, dict):
-            name, lo, va = entry["name"], entry.get("loadout"), entry.get("variant")
+            name, lo, va, ph = entry["name"], entry.get("loadout"), entry.get("variant"), entry.get("phase")
         else:
-            name, lo, va = entry, None, None
+            name, lo, va, ph = entry, None, None, None
         lo = (loadouts or {}).get(key, lo)
         va = (variants or {}).get(key, va)
-        texts[key], refs[key], voices[key] = resolve_entry(name, lo, va)
+        ph = (phases or {}).get(key, ph)
+        texts[key], refs[key], voices[key] = resolve_entry(name, lo, va, ph)
     return (texts, refs, voices) if with_voice else (texts, refs)
+
+
+def screen_pos(direction, camera_from):
+    """方位换算成画面位置。direction：物体在地点的哪一侧；camera_from：机位在哪一侧（朝反方向拍）。"""
+    if direction in ("中", "中央"):
+        return "画面中央"
+    if direction not in DIRS or camera_from not in DIRS:
+        raise SystemExit(f"方位只能是：{'、'.join(DIRS)}、中")
+    view = (DIRS[camera_from] + 180) % 360           # 镜头朝向
+    rel = (DIRS[direction] - view) % 360
+    if rel <= 45 or rel >= 315:
+        return "画面深处"
+    if rel < 135:
+        return "画面右侧"
+    if rel <= 225:
+        return "画面前景"
+    return "画面左侧"
+
+
+def layout_text(layout, camera_from):
+    """地点布局按机位换算成画面描述，如“画面右侧是岩柱群”。"""
+    out = []
+    for direction, what in (layout or {}).items():
+        if direction in DIRS or direction in ("中", "中央"):
+            out.append(f"{screen_pos(direction, camera_from)}是{what}")
+    return "，".join(out)
+
+
+def opposite(a, b):
+    return a in DIRS and b in DIRS and abs((DIRS[a] - DIRS[b]) % 360 - 180) <= 45
+
+
+def axis_side(pos_a, pos_b, camera_from):
+    """轴线规则：两个角色的连线是轴线，返回机位在轴线哪一侧（1 / -1），机位正好在轴线上返回 0。"""
+    import math
+    def xy(d):
+        if d in ("中", "中央"):
+            return 0.0, 0.0
+        r = math.radians(DIRS[d])
+        return math.sin(r), math.cos(r)       # 东为 x 正，北为 y 正
+    (ax, ay), (bx, by), (cx, cy) = xy(pos_a), xy(pos_b), xy(camera_from)
+    cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    return 0 if abs(cross) < 1e-6 else (1 if cross > 0 else -1)
 
 
 def find_skill(ref):
@@ -344,7 +441,8 @@ def cmd_wear(a):
         slots.pop(a.slot, None)
         print(f"{a.name} 脱下了 {a.slot}")
     else:
-        slots[a.slot] = value
+        opts = {k: v for k, v in (("dye", a.dye), ("quality", a.quality), ("refine", a.refine)) if v}
+        slots[a.slot] = dict(item=value, **opts) if opts else value
         item, _ = find(value)
         hint = f"（单品定义：{KIND_LABEL[item['kind']]}）" if item else "（直接描述）"
         print(f"{a.name} 的 {a.slot}：{value} {hint}")
@@ -369,7 +467,7 @@ def cmd_loadout(a):
 
 def cmd_describe(a):
     data, _ = load(a.name)
-    print(describe(data, a.loadout, a.variant))
+    print(describe(data, a.loadout, a.variant, a.phase))
 
 
 def cmd_slots(_):
@@ -400,12 +498,16 @@ def cmd_sheet(a):
     if avoid and not backend.supports_neg:
         print(f"  提醒：{backend.title} 不支持负面提示词，avoid（{avoid}）不会生效；请在描述里用正面写法代替否定")
     seed = a.seed if a.seed is not None else data.get("seed", 42)
-    desc = describe(data, a.loadout, a.variant)
+    desc = describe(data, a.loadout, a.variant, a.phase)
+    if data["kind"] == "scene" and data.get("layout") and "layout" not in sheets:
+        spots = "，".join(f"{k}侧是{v}" if k in DIRS else f"中央是{v}" for k, v in data["layout"].items())
+        sheets["layout"] = {"prompt": f"俯视角度的平面布局图，像游戏地图一样清楚标出各区域：{spots}，上北下南", "size": "1024x1024"}
+        todo = {k: v for k, v in sheets.items() if not a.only or k in a.only}
     made = []
     for key, sheet in todo.items():
         w, h = map(int, sheet["size"].split("x"))
         prompt = "，".join(x for x in (desc, sheet["prompt"], style) if x)
-        tag = f"{key}@{a.variant}" if a.variant else (f"{key}@{a.loadout}" if a.loadout else key)
+        tag = key + "".join(f"@{x}" for x in (a.variant, a.loadout, a.phase) if x)
         print(f"\n== {tag}  {w}x{h}  种子 {seed}\n  {prompt}", flush=True)
         t0 = time.time()
         img, _ = backend.generate(prompt, neg, w, h, backend.final_steps, seed, backend.cfg)
@@ -417,7 +519,10 @@ def cmd_sheet(a):
         print(f"  -> {os.path.relpath(os.path.join(d, fname), HERE)}  ({time.time() - t0:.0f}s)", flush=True)
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
-    if a.variant:
+    if a.phase:
+        pi = raw.setdefault("phase_images", {})
+        pi[a.phase] = list(dict.fromkeys((pi.get(a.phase) or []) + made))
+    elif a.variant:
         vi = raw.setdefault("variant_images", {})
         vi[a.variant] = list(dict.fromkeys((vi.get(a.variant) or []) + made))
     elif a.loadout:
@@ -479,8 +584,9 @@ def cmd_show(a):
         for s in slot_table():
             v = data["slots"].get(s["slot"])
             if v:
-                item, _ = find(v)
-                print(f"    {s['slot']}：{v}{'（' + KIND_LABEL[item['kind']] + '）' if item else ''}")
+                item, _ = find(item_name(v))
+                extra = "".join(f" {k}={x}" for k, x in v.items() if k != "item") if isinstance(v, dict) else ""
+                print(f"    {s['slot']}：{item_name(v)}{'（' + KIND_LABEL[item['kind']] + '）' if item else ''}{extra}")
     for name, ch in (data.get("loadouts") or {}).items():
         print(f"  套装 {name}：{ch}")
     if data.get("skills"):
@@ -496,6 +602,13 @@ def cmd_show(a):
         print(f"  上级：{data['parent']}")
     if data.get("variants"):
         print(f"  变体：{'、'.join(data['variants'])}")
+    if data.get("layout"):
+        print("  布局：" + "，".join(f"{k}：{v}" for k, v in data["layout"].items()))
+    if data.get("phases"):
+        print(f"  阶段：{'、'.join(data['phases'])}")
+    if data.get("weakness"):
+        w = data["weakness"]
+        print(f"  弱点：{w.get('name', '')}——{w.get('desc', '')}（显露：{w.get('show', 'always')}）")
     print(f"  必须：{'、'.join(data.get('must', [])) or '-'}   避免：{'、'.join(data.get('avoid', [])) or '-'}")
     v = data.get("voice") or {}
     if kind in ("character", "monster"):
@@ -529,6 +642,9 @@ def main():
     w.add_argument("name")
     w.add_argument("slot")
     w.add_argument("value", nargs="+")
+    w.add_argument("--dye", help="染色，如 黑金（替换单品定义里 color 指定的原始颜色）")
+    w.add_argument("--quality", choices=list(QUALITY), help="品质：越高光效越强")
+    w.add_argument("--refine", type=int, help="强化等级：5 以上光效明显，10 以上极为耀眼")
     lo = sub.add_parser("loadout", help="定义套装：覆盖部分栏位，如 护甲=- 上衣=素色和服")
     lo.add_argument("name")
     lo.add_argument("set_name")
@@ -537,6 +653,7 @@ def main():
     de.add_argument("name")
     de.add_argument("--loadout")
     de.add_argument("--variant")
+    de.add_argument("--phase")
     sub.add_parser("slots", help="查看全部栏位")
     s = sub.add_parser("sheet", help="按定义生成设定图")
     s.add_argument("name")
@@ -544,6 +661,7 @@ def main():
     s.add_argument("--seed", type=int, help="覆盖定义里的种子")
     s.add_argument("--loadout", help="按某个套装生成（人物）")
     s.add_argument("--variant", help="按某个变体生成（地点）")
+    s.add_argument("--phase", help="按某个阶段生成（怪物）")
     s.add_argument("--model", default="z-image-turbo")
     s.add_argument("--quantize", type=int)
     im = sub.add_parser("import", help="导入外部生成的图片作为设定图")

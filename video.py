@@ -452,23 +452,24 @@ def load_board(path):
     own_refs = dict(settings.get("refs") or {})  # 分镜里直接写的 refs 文字，优先于定义
     cast = settings.get("cast")
     assets = None
-    if cast or any(s.get("skill") for s in board["shots"]):
+    if cast or any(s.get("skill") or s.get("blocking") or s.get("camera_from") for s in board["shots"]):
         sys.path.insert(0, HERE)
         import assets
     cache = {}
 
-    def cast_for(loadouts=None, variants=None):
-        """按镜头的换装/变体解析 cast，相同组合只解析一次。"""
-        key = (json.dumps(loadouts or {}, sort_keys=True), json.dumps(variants or {}, sort_keys=True))
+    def cast_for(loadouts=None, variants=None, phases=None):
+        """按镜头的换装/变体/阶段解析 cast，相同组合只解析一次。"""
+        key = tuple(json.dumps(x or {}, sort_keys=True) for x in (loadouts, variants, phases))
         if key not in cache:
-            cache[key] = assets.resolve_cast(cast, True, loadouts, variants) if cast else ({}, {}, {})
+            cache[key] = assets.resolve_cast(cast, True, loadouts, variants, phases) if cast else ({}, {}, {})
         return cache[key]
 
     per_asset = int(settings.get("ref_images", 1))
     max_refs = int(settings.get("max_refs", 3))  # 参考图太多会更慢、更占内存
     jobs = []
+    prev_cam, axis_memory = None, {}
     for shot in board["shots"]:
-        texts, cast_imgs, cast_voices = cast_for(shot.get("loadout"), shot.get("variant"))
+        texts, cast_imgs, cast_voices = cast_for(shot.get("loadout"), shot.get("variant"), shot.get("phase"))
         shot_settings = dict(settings, refs={**texts, **own_refs})
         job = {k: v for k, v in settings.items() if k not in REF_KEYS}
         job.update({k: v for k, v in shot.items() if not k.startswith("_")})
@@ -490,6 +491,32 @@ def load_board(path):
             job["_speaker_name"] = sp["name"]
             if sp.get("voice") and not shot.get("voice"):
                 job["_voice_cfg"] = sp["voice"]
+        cam = shot.get("camera_from") or settings.get("camera_from")
+        if job.get("blocking") or (cam and any(v.get("layout") for v in cast_voices.values())):
+            # 站位：东南西北 -> 画面左右、深处、前景；机位越过轴线时提醒（左右会反转）
+            if not cam:
+                raise SystemExit(f"{shot['id']} 写了 blocking，需要 camera_from（机位在地点的哪一侧）")
+            blk = job.get("blocking") or {}
+            if len(blk) >= 2:  # 轴线规则：两个角色的连线是轴线，机位要待在同一侧，否则左右反转
+                (ka, pa), (kb, pb) = list(blk.items())[:2]
+                pair = tuple(sorted((ka, kb)))
+                side = assets.axis_side(blk[pair[0]], blk[pair[1]], cam)
+                last = axis_memory.get(pair)
+                if side and last and side != last[0]:
+                    print(f"  提示：{shot['id']} 机位（{cam}侧）越过了 {pair[0]}–{pair[1]} 的轴线（上次在 {last[1]} 是另一侧），"
+                          f"画面里两人的左右位置会反转；除非有意为之，建议保持在同一侧或加过渡镜头")
+                if side:
+                    axis_memory[pair] = (side, shot["id"])
+            elif prev_cam and assets.opposite(prev_cam, cam):
+                print(f"  提示：{shot['id']} 机位从{prev_cam}侧跳到对面的{cam}侧，画面左右会反转")
+            prev_cam = cam
+            place = [f"{cast_voices[k]['name'] if k in cast_voices else k}位于{assets.screen_pos(d, cam)}"
+                     for k, d in (job.get("blocking") or {}).items()]
+            for k, v in cast_voices.items():  # 地点布局也按机位换算
+                if v.get("layout") and "{" + k + "}" in (job.get("keyframe") or ""):
+                    place.append(assets.layout_text(v["layout"], cam))
+            if place and job.get("keyframe"):
+                job["keyframe"] += "，" + "，".join(p for p in place if p)
         if job.get("keyframe"):
             raw_kf = job["keyframe"]
             # 这个镜头出现了哪些定义（按在描述里出现的顺序），各取前 n 张参考图（本体在前、装备在后），总数不超过 max_refs
