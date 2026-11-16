@@ -32,6 +32,8 @@
   /ai auto 工具|off  每次出图前自动执行某个工具（如英译，给英文模型用）
   /ai provider 名称  切换服务商（longcat、deepseek、qwen、ollama 或自定义）
   /use             采用 /ai 的结果作为新提示词并出预览
+  /keyframe 片名 镜号  把最近一张图存成 projects/片名/ 分镜里该镜头的关键帧（分镜不存在就新建），
+                   之后用 video.py board 让它动起来
   /open on|off     出图后是否自动用"预览"打开
   /show            显示当前设置
   /quit
@@ -68,6 +70,7 @@ COMMANDS = {
     "/reset": "清空所有预设",
     "/ai": "用大模型处理提示词（扩写、英译、看图反推…，可自定义）",
     "/use": "采用 /ai 的结果作为提示词并出预览",
+    "/keyframe": "把最近一张图存成分镜关键帧：/keyframe 片名 镜号",
     "/size": "自定义尺寸 WxH",
     "/steps": "预览步数",
     "/cfg": "guidance_scale",
@@ -209,6 +212,8 @@ class Studio:
         self.sel = {key: (list(getattr(a, key, None) or []) if key in MULTI else getattr(a, key, None))
                     for key in GROUPS}
         self.last_prompt = None
+        self.last_path = None   # 最近一张图，/keyframe 用
+        self.last_seed = None
         self.ai = AI(a.ai_provider)
         self.ai_auto = a.ai_auto
         self.ai_candidate = None
@@ -264,6 +269,7 @@ class Studio:
         if k in self.done:
             print(f"  参数和种子都没变，结果会一模一样，直接打开已有的：{self.done[k]}")
             print("  想要不同的图：/seed + 换种子，或 /batch N")
+            self.last_path, self.last_seed = self.done[k], seed
             if self.auto_open:
                 subprocess.run(["open", self.done[k]])
             return
@@ -286,6 +292,7 @@ class Studio:
         path = os.path.join(OUT_DIR, f"{self.idx:03d}_s{seed}_{steps}st_{self.w}x{self.h}{tag}.png")
         img.save(path)
         self.done[k] = path
+        self.last_path, self.last_seed = path, seed
         with open(os.path.join(OUT_DIR, "log.txt"), "a", encoding="utf-8") as f:
             f.write(f"{os.path.basename(path)}\tcfg={self.cfg}\tneg={self.neg!r}\t{' '.join(prompt.split())}\n")
         note = f"，实际 {ran} 步" if refine else ""
@@ -335,6 +342,51 @@ class Studio:
             self.show()
         else:
             print(f"  没有“{arg}”这个{label}，{cmd} 查看列表")
+
+    def save_keyframe(self, arg):
+        """把最近一张图复制到 projects/<片名>/<镜号>.png，并写进分镜文件。"""
+        import json
+        import shutil
+        parts = arg.split()
+        if len(parts) != 2:
+            print("  用法：/keyframe 片名 镜号，例如 /keyframe 猫咖啡店 S02")
+            return
+        if not self.last_path or not os.path.exists(self.last_path):
+            print("  还没有出过图，先生成一张")
+            return
+        name, sid = parts
+        proj = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects", name)
+        os.makedirs(proj, exist_ok=True)
+        dst = os.path.join(proj, f"{sid}.png")
+        shutil.copyfile(self.last_path, dst)
+
+        board_path = os.path.join(proj, "storyboard.json")
+        if os.path.exists(board_path):
+            with open(board_path, encoding="utf-8") as f:
+                board = json.load(f)
+        else:
+            board = {"settings": {"_说明": "全片设置，镜头里同名字段会覆盖这里；{character}/{scene} 会被替换",
+                                  "character": "", "scene": "", "ratio": "横屏", "fps": 25, "seconds": 2,
+                                  "seeds": [42]},
+                     "shots": []}
+        source = {"from": os.path.relpath(self.last_path, os.path.dirname(os.path.abspath(__file__))),
+                  "model": self.backend.key, "seed": self.last_seed, "prompt": self.compose(self.last_prompt or "")}
+        shot = next((x for x in board["shots"] if x.get("id") == sid), None)
+        if shot is None:
+            shot = {"id": sid, "prompt": "", "camera": "固定", "motion": "自然"}
+            board["shots"].append(shot)
+            board["shots"].sort(key=lambda x: x.get("id", ""))
+        shot["image"] = f"{sid}.png"
+        shot["_keyframe"] = source
+        if not shot.get("prompt"):
+            # 视频提示词要写“怎么动”；先放图片提示词当起点，提醒用户补动作
+            shot["prompt"] = source["prompt"]
+            shot["_说明"] = "prompt 先复制了关键帧的图片提示词，请改成描述动作的句子，例如“猫慢慢抬起头”"
+        with open(board_path, "w", encoding="utf-8") as f:
+            json.dump(board, f, ensure_ascii=False, indent=2)
+        print(f"  关键帧 -> {dst}")
+        print(f"  已写入分镜 {board_path} 的 {sid}（{len(board['shots'])} 个镜头）")
+        print(f"  生成视频：.venv-mlx/bin/python video.py board {os.path.relpath(board_path)} --only {sid}")
 
     def ai_command(self, arg):
         name, _, rest = arg.partition(" ")
@@ -490,6 +542,8 @@ class Studio:
             else:
                 self.last_prompt, self.ai_candidate = self.ai_candidate, None
                 self.generate(self.last_prompt, self.preview_steps)
+        elif cmd == "/keyframe":
+            self.save_keyframe(arg)
         elif cmd == "/open":
             self.auto_open = arg != "off"
             self.show()

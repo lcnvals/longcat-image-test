@@ -14,6 +14,11 @@
   .venv-mlx/bin/python video.py board projects/猫咖啡店/storyboard.json --concat    # 拼接成片
   .venv-mlx/bin/python video.py init projects/猫咖啡店                             # 生成分镜模板
 
+局部修改已有视频（任何 video.py 生成的视频都可以，包括分镜里的镜头）：
+  .venv-mlx/bin/python video.py retake 视频.mp4 --from 0.8 --to 1.6 -p "猫转头看向镜头"   # 只重做这一段
+  .venv-mlx/bin/python video.py extend 视频.mp4 --seconds 1 -p "猫跳下窗台"            # 往后续写
+  .venv-mlx/bin/python video.py extend 视频.mp4 --image 结尾.png                        # 续写到指定画面
+
 加 --dry-run 只打印将要执行的命令，不真正生成。
 """
 import argparse
@@ -123,6 +128,14 @@ def prepare_image(src, w, h, dst_dir):
     return out
 
 
+def file_sha1(path):
+    if not path or not os.path.exists(path):
+        return None
+    import hashlib
+    with open(path, "rb") as f:
+        return hashlib.sha1(f.read()).hexdigest()[:16]
+
+
 # ---------------- 生成 ----------------
 
 def ltx_command(cfg, job, prompt, seed, w, h, frames, out):
@@ -168,7 +181,9 @@ def run_job(cfg, job, out_dir, name_prefix="", dry=False):
         meta = out[:-4] + ".json"
         record = {"prompt": prompt, "seed": seed, "size": [w, h], "frames": frames, "fps": fps,
                   "image": job.get("image"), "end_image": job.get("end_image"), "neg": job.get("neg"),
-                  "image_strength": job.get("image_strength", DEFAULTS["image_strength"])}
+                  "image_strength": job.get("image_strength", DEFAULTS["image_strength"]),
+                  # 记录关键帧内容指纹：同名图片被 /keyframe 覆盖后，要能识别出来重新生成
+                  "image_sha1": file_sha1(job.get("image")), "end_image_sha1": file_sha1(job.get("end_image"))}
         if os.path.exists(out) and os.path.exists(meta) and json.load(open(meta, encoding="utf-8")) == record:
             print(f"  种子 {seed}：参数完全相同的视频已存在，跳过 -> {out}")
             results.append((seed, out))
@@ -191,6 +206,96 @@ def run_job(cfg, job, out_dir, name_prefix="", dry=False):
         print(f"  -> {out}  ({time.time() - t0:.0f}s)")
         results.append((seed, out))
     return results
+
+
+# ---------------- 局部修改：retake / extend ----------------
+
+def probe(video):
+    """返回 (帧数, 帧率, 宽, 高, 元数据)。优先读 video.py 写的同名 .json，没有就用 ffprobe。"""
+    meta_path = video[:-4] + ".json"
+    meta = json.load(open(meta_path, encoding="utf-8")) if os.path.exists(meta_path) else {}
+    if {"frames", "fps", "size"} <= meta.keys():
+        return meta["frames"], meta["fps"], meta["size"][0], meta["size"][1], meta
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise SystemExit("读取视频信息需要 ffprobe：brew install ffmpeg")
+    out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries",
+                          "stream=nb_read_frames,r_frame_rate,width,height", "-of", "json", video],
+                         capture_output=True, text=True).stdout
+    st = json.loads(out)["streams"][0]
+    num, den = map(int, st["r_frame_rate"].split("/"))
+    return int(st["nb_read_frames"]), round(num / den), st["width"], st["height"], meta
+
+
+def latent_index(frame):
+    """画面帧 -> 潜空间帧：第 0 帧单独一个，之后每 8 帧压成一个。"""
+    return 0 if frame <= 0 else (frame - 1) // 8 + 1
+
+
+def latent_range_seconds(start, end, fps):
+    """潜空间帧区间 [start, end) 实际覆盖的秒数范围。"""
+    first = 0 if start == 0 else 8 * (start - 1) + 1
+    last = 8 * (end - 1)
+    return first / fps, last / fps
+
+
+def edit_job(cfg, a, kind):
+    video = a.video
+    if not os.path.exists(video):
+        raise SystemExit(f"找不到视频：{video}")
+    frames, fps, w, h, meta = probe(video)
+    job = {k: v for k, v in vars(a).items() if v is not None and k not in ("cmd", "dry_run", "video")}
+    job["prompt"] = job.get("prompt") or meta.get("prompt")
+    if not job["prompt"]:
+        raise SystemExit("这个视频没有记录提示词，请用 -p 指定")
+    prompt = compose(job)
+    ltx = cfg.get("ltx", {})
+    base = video[:-4]
+    seeds = job.get("seeds") or DEFAULTS["seeds"]
+    total_latent = latent_index(frames - 1) + 1
+
+    if kind == "retake":
+        start = latent_index(round(a.start * fps))
+        end = min(total_latent, latent_index(round(a.end * fps)) + 1)
+        if end <= start:
+            raise SystemExit("--to 必须大于 --from")
+        t0, t1 = latent_range_seconds(start, end, fps)
+        print(f"  原视频 {frames} 帧 @ {fps}fps（{(frames - 1) / fps:.2f} 秒），重做 {t0:.2f}–{t1:.2f} 秒"
+              f"（潜空间帧 {start}–{end - 1}）")
+        extra = ["--start", str(start), "--end", str(end)]
+        tag = f"_retake{t0:.1f}-{t1:.1f}"
+    else:
+        n = max(1, round(float(job.get("seconds", 2)) * fps / 8))
+        print(f"  原视频 {frames} 帧（{(frames - 1) / fps:.2f} 秒），往后续写约 {8 * n / fps:.2f} 秒（{8 * n} 帧）")
+        extra = ["--extend-frames", str(n), "--direction", "after"]
+        if job.get("image"):
+            extra += ["--image", prepare_image(job["image"], w, h, os.path.dirname(video) or "."), "-1", "1.0"]
+        tag = f"_ext{8 * n / fps:.1f}s"
+    print(f"  实际提示词：{prompt}")
+
+    for seed in seeds:
+        out = f"{base}{tag}_s{seed}.mp4"
+        cmd = [ltx["cli"], kind, "--model", ltx["model"], "--gemma", ltx["gemma"], "--distilled",
+               "--video", video, "-p", prompt, "--seed", str(seed), "-o", out] + extra
+        if job.get("low_ram", DEFAULTS["low_ram"]):
+            cmd.append("--low-ram")
+        if a.dry_run:
+            print("  [dry-run] " + " ".join(cmd))
+            continue
+        print(f"  生成中：种子 {seed}...", flush=True)
+        t = time.time()
+        log = out[:-4] + ".log"
+        with open(log, "w", encoding="utf-8") as f:
+            rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT,
+                                env=dict(os.environ, HF_HUB_OFFLINE="1")).returncode
+        if rc != 0 or not os.path.exists(out):
+            print(f"  ❌ 失败（exit={rc}），日志：{log}")
+            continue
+        nf, nfps, nw, nh, _ = probe(out)
+        with open(out[:-4] + ".json", "w", encoding="utf-8") as f:
+            json.dump({"prompt": prompt, "seed": seed, "size": [nw, nh], "frames": nf, "fps": nfps,
+                       "from": video, "edit": kind}, f, ensure_ascii=False, indent=1)
+        print(f"  -> {out}  ({time.time() - t:.0f}s，{nf} 帧 / {(nf - 1) / nfps:.2f} 秒)")
 
 
 # ---------------- 分镜 ----------------
@@ -284,6 +389,25 @@ def main():
     b.add_argument("--only", nargs="+", help="只生成这些镜头，如 S02 S05")
     b.add_argument("--concat", action="store_true", help="生成后按镜头顺序拼接成片（用每个镜头的 pick 种子）")
     b.add_argument("--dry-run", action="store_true")
+    def add_edit_args(p):
+        p.add_argument("video")
+        p.add_argument("-p", "--prompt", help="提示词（默认沿用原视频的）")
+        p.add_argument("--seed", dest="seeds", type=int, nargs="+")
+        p.add_argument("--camera", choices=list(CAMERAS))
+        p.add_argument("--motion", choices=list(MOTIONS))
+        p.add_argument("--style", choices=list(GROUPS["style"][2]))
+        p.add_argument("--ai", help="先用 AI 工具处理提示词")
+        p.add_argument("--no-low-ram", dest="low_ram", action="store_false", default=None)
+        p.add_argument("--dry-run", action="store_true")
+
+    r = sub.add_parser("retake", help="只重做视频里的一段（按秒指定）")
+    add_edit_args(r)
+    r.add_argument("--from", dest="start", type=float, required=True, help="开始秒数")
+    r.add_argument("--to", dest="end", type=float, required=True, help="结束秒数")
+    e = sub.add_parser("extend", help="往后续写视频")
+    add_edit_args(e)
+    e.add_argument("--seconds", type=float, help="续写秒数（默认 2）")
+    e.add_argument("--image", help="续写结尾要到达的画面")
     i = sub.add_parser("init", help="在目录里生成分镜模板")
     i.add_argument("project_dir")
     a = ap.parse_args()
@@ -299,6 +423,9 @@ def main():
         return
 
     cfg = load_cfg()
+    if a.cmd in ("retake", "extend"):
+        edit_job(cfg, a, a.cmd)
+        return
     if a.cmd == "gen":
         job = {k: v for k, v in vars(a).items() if v is not None and k not in ("cmd", "dry_run")}
         run_job(cfg, job, OUT_DIR, dry=a.dry_run)

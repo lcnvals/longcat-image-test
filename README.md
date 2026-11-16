@@ -286,10 +286,11 @@ git clone https://github.com/dgrauet/ltx-2-mlx
 git -C ltx-2-mlx checkout 895201df379b079c2154738bcf92005b7a371923   # 24GB 实测用的版本
 python3 -m venv ltx-mlx
 ltx-mlx/bin/pip install -e ltx-2-mlx/packages/ltx-core-mlx -e ltx-2-mlx/packages/ltx-pipelines-mlx av imageio-ffmpeg psutil
-# 模型约 20GB（HF），文本编码器 Gemma 约 8GB（魔搭）
+# 模型约 20.5GB（HF），文本编码器 Gemma 约 8GB（魔搭）
 hf download dgrauet/ltx-2.3-mlx-q4 --include "*.json" "connector.safetensors" \
   "transformer-distilled-1.1.safetensors" "spatial_upscaler_x2_v1_1.safetensors" \
-  "vae_decoder.safetensors" "vae_encoder.safetensors" --local-dir ltx-model
+  "vae_decoder.safetensors" "vae_encoder.safetensors" \
+  "audio_vae.safetensors" "vocoder.safetensors" --local-dir ltx-model   # retake/extend 必须要音频解码器
 modelscope download --model mlx-community/gemma-3-12b-it-4bit --local-dir gemma
 ```
 
@@ -332,6 +333,40 @@ modelscope download --model mlx-community/gemma-3-12b-it-4bit --local-dir gemma
 ```
 
 `storyboard.json` 由全片设置 `settings` 和镜头列表 `shots` 组成：镜头里的字段会覆盖全片设置；`{character}`、`{scene}` 会替换成设定里的角色和场景描述（保证每个镜头的描述一字不差）；`image` 是关键帧路径（相对分镜文件）；`pick` 指定拼接时用哪个种子。每个镜头输出到 `projects/<片名>/<镜号>/`。改了某个镜头只需要重跑它，没改的镜头会自动跳过。
+
+### 局部修改：只重做一段 / 往后续写
+
+任何 `video.py` 生成的视频（包括分镜里的镜头）都可以局部修改，原视频保留，结果另存为新文件：
+
+```bash
+# 只重做 0.8–1.6 秒这一段，其余部分不变
+.venv-mlx/bin/python video.py retake 视频.mp4 --from 0.8 --to 1.6 -p "猫转头看向镜头"
+# 往后续写 1 秒；不写 -p 就沿用原视频的提示词
+.venv-mlx/bin/python video.py extend 视频.mp4 --seconds 1 -p "猫站起来，跳下窗台"
+# 续写到指定的结尾画面
+.venv-mlx/bin/python video.py extend 视频.mp4 --image 结尾.png
+```
+
+- retake 按 8 帧一组重做，实际范围会对齐到组边界，命令会打印实际覆盖的秒数（例如 0.8–1.6 秒实际是 0.68–1.60 秒）。
+- 实测（512×320，约 2 秒）：retake 约 142 秒，区间外画面不变；extend 续写 1 秒约 117 秒，原有帧完整保留，接缝处看不出拼接。
+- retake 改动动作的幅度比较保守；extend 沿用弱动作的提示词时续写段几乎静止，**续写时用 `-p` 写一个新的、明确的动作**。
+- 只能往后续写（蒸馏模型不支持往前）。
+
+### 从 studio 存关键帧到分镜
+
+在 studio 里出到满意的图后，输入：
+
+```
+/keyframe 猫咖啡店 S02
+```
+
+会把最近一张图复制成 `projects/猫咖啡店/S02.png`，并写进 `projects/猫咖啡店/storyboard.json` 的 S02 镜头（分镜文件不存在就新建，同一镜号会覆盖关键帧）。镜头的 `prompt` 先复制图片提示词，**需要改成描述动作的句子**，然后退出 studio，运行：
+
+```bash
+.venv-mlx/bin/python video.py board projects/猫咖啡店/storyboard.json --only S02
+```
+
+关键帧图片被覆盖后，`video.py` 会根据图片内容识别出来并重新生成，不会误跳过。
 
 ### 实测（M1 Pro 32GB）
 
