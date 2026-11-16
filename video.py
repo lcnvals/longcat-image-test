@@ -480,9 +480,13 @@ def load_board(path):
             job["prompt"] = "，".join(x for x in (job["prompt"], stxt) if x)
             if job.get("keyframe"):
                 job["keyframe"] = job["keyframe"] + "，" + stxt
+            stage = job.get("stage") or "释放"
             for k, v in (sk.get("edit") or {}).items():
-                job.setdefault(k, v) if k not in shot else None
-            if sk.get("sfx") and "sfx" not in shot:
+                # 剪辑方式按阶段生效：闪白只在命中瞬间，震屏在释放和命中；前摇是蓄力，保持安静
+                if (k == "in" and stage != "命中") or (k == "shake" and stage == "前摇"):
+                    continue
+                job.setdefault(k, v)
+            if sk.get("sfx") and "sfx" not in shot and stage != "前摇":
                 job["sfx"] = sk["sfx"]
         if job.get("speaker"):  # 台词跟随角色：用角色定义里的音色，字幕可带上角色名
             sp = cast_voices.get(job["speaker"])
