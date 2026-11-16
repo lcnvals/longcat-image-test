@@ -1,14 +1,36 @@
 """studio.py 的模型后端。每个后端把一个模型包装成统一的 generate() 接口。
 
-两套运行环境（依赖互不兼容，分开装）：
-  longcat                     -> .venv      （PyTorch + diffusers，MPS）
-  z-image-turbo / flux2-klein-4b -> .venv-mlx  （mflux，Apple MLX 原生，更省内存、更快）
+运行环境（依赖互不兼容，分开装）：
+  Mac：
+    longcat                        -> .venv      （PyTorch + diffusers，MPS）
+    z-image-turbo / flux2-klein-4b -> .venv-mlx  （mflux，Apple MLX 原生，更省内存、更快）
+  Linux + NVIDIA（deploy/setup_cuda.sh 一键安装）：
+    三个模型都用 .venv-cuda（PyTorch + diffusers，CUDA）；同名 --model，自动选用 CUDA 实现
 
 依赖都在各后端内部导入，所以 studio.py 在两个环境里都能运行。
 """
 import gc
 import os
+import platform
 import time
+
+
+def torch_device():
+    """CUDA（NVIDIA）优先，其次 MPS（Mac），最后 CPU。"""
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def torch_empty_cache(torch):
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 class Backend:
@@ -47,7 +69,7 @@ class LongCatBackend(Backend):
         from transformers import Qwen2_5_VLForConditionalGeneration
 
         self.torch = torch
-        self.device, self.dtype = "mps", torch.bfloat16
+        self.device, self.dtype = torch_device(), torch.bfloat16
         t0 = time.time()
         # 先单独加载并量化文本编码器（此时 transformer 还没进内存，避免峰值叠加）
         te = Qwen2_5_VLForConditionalGeneration.from_pretrained(f"{self.MODEL}/text_encoder", dtype=self.dtype)
@@ -71,7 +93,7 @@ class LongCatBackend(Backend):
             return prompt_embeds.to(self.device), ids.to(self.device)
 
         pipe.encode_prompt = cached_encode
-        pipe.set_progress_bar_config(disable=True)  # MPS 异步，进度条时间不准，不如不显示
+        pipe.set_progress_bar_config(disable=self.device == "mps")  # MPS 异步，进度条时间不准
         self.pipe = pipe
         self.cache = {}
         print(f"  全部加载完成 {time.time() - t0:.0f}s")
@@ -133,8 +155,7 @@ class LongCatBackend(Backend):
         return img, len(extra["sigmas"]) if init else steps
 
     def cleanup(self):
-        gc.collect()
-        self.torch.mps.empty_cache()
+        torch_empty_cache(self.torch)
 
 
 class MfluxBackend(Backend):
@@ -197,4 +218,76 @@ class Flux2KleinBackend(MfluxBackend):
         return Flux2Klein(quantize=q, model_path=path, model_config=ModelConfig.flux2_klein_4b())
 
 
-BACKENDS = {b.key: b for b in (LongCatBackend, ZImageTurboBackend, Flux2KleinBackend)}
+class DiffusersImageBackend(Backend):
+    """Linux + NVIDIA 上用 diffusers 跑 Z-Image / FLUX.2 klein。模型目录与 Mac 上 mflux 用的相同（diffusers 格式）。
+
+    注意：这部分是为云服务器准备的，作者没有 NVIDIA 机器，尚未实测。
+    """
+    env = ".venv-cuda"
+    cfg, supports_neg = None, False
+    default_size = "1024x1024"
+    pipeline = ""
+    guidance = 0.0
+
+    def __init__(self, **_):
+        import diffusers
+        import torch
+        self.torch = torch
+        self.device = torch_device()
+        path = f"./models/{self.key}"
+        if not os.path.isdir(path):
+            raise SystemExit(f"找不到模型目录 {path}，先运行 deploy/setup_cuda.sh 下载模型")
+        t0 = time.time()
+        cls = getattr(diffusers, self.pipeline)
+        self.pipe = cls.from_pretrained(path, torch_dtype=torch.bfloat16)
+        vram = torch.cuda.mem_get_info()[1] / 1e9 if self.device == "cuda" else 0  # 显存总量
+        if self.device == "cuda" and vram < 20:
+            self.pipe.enable_model_cpu_offload()   # 显存小于 20GB：按组件在显存和内存之间搬运
+        else:
+            self.pipe.to(self.device)
+        self.out_dir = f"./outputs/{self.key}"
+        print(f"  {self.title} 加载完成（{self.device}）{time.time() - t0:.0f}s")
+
+    def generate(self, prompt, neg, w, h, steps, seed, cfg, init=None, strength=None):
+        torch = self.torch
+        kw = dict(prompt=prompt, height=h, width=w, num_inference_steps=steps, guidance_scale=self.guidance,
+                  generator=torch.Generator("cpu").manual_seed(seed))
+        if init:
+            img2img = getattr(self, "img2img", None)
+            if not img2img:
+                raise RuntimeError(f"{self.title} 的 CUDA 实现暂不支持 /refine")
+            from PIL import Image
+            pipe = img2img.from_pipe(self.pipe)
+            img = pipe(image=Image.open(init).convert("RGB"), strength=strength, **kw).images[0]
+            return img, max(1, int(steps * strength))
+        return self.pipe(**kw).images[0], steps
+
+    def cleanup(self):
+        torch_empty_cache(self.torch)
+
+
+class ZImageTurboCuda(DiffusersImageBackend):
+    key = "z-image-turbo"
+    title = "Z-Image-Turbo（6B，CUDA）"
+    pipeline = "ZImagePipeline"
+    preview_steps = final_steps = 8
+    guidance = 0.0
+
+    @property
+    def img2img(self):
+        import diffusers
+        return diffusers.ZImageImg2ImgPipeline
+
+
+class Flux2KleinCuda(DiffusersImageBackend):
+    key = "flux2-klein-4b"
+    title = "FLUX.2 klein 4B（CUDA）"
+    pipeline = "Flux2KleinPipeline"
+    preview_steps = final_steps = 4
+    guidance = 1.0
+
+
+if platform.system() == "Darwin":
+    BACKENDS = {b.key: b for b in (LongCatBackend, ZImageTurboBackend, Flux2KleinBackend)}
+else:  # Linux / NVIDIA：同名模型换成 diffusers 实现，分镜文件和命令不用改
+    BACKENDS = {b.key: b for b in (LongCatBackend, ZImageTurboCuda, Flux2KleinCuda)}
