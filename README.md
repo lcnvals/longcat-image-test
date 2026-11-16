@@ -9,7 +9,8 @@ LongCat 的官方示例针对 CUDA，并用 `enable_model_cpu_offload()` 节省�
 | `studio.py` | 常驻交互模式：模型只加载一次，先低步数预览、再出正式图；带画幅、镜头、光线、风格等预设 | 已在 M1 Pro 32GB 上测试 |
 | `t2i.py` | 单次文生图，文本编码器和 transformer 分段加载 | 已在 M1 Pro 32GB 上测试 |
 | `edit.py` | LongCat-Image-Edit-Turbo 改图（照片 + 指令） | 未实测 |
-| `presets.py` | `studio.py` 用的提示词预设，可以自己加 | — |
+| `presets.py` | `studio.py`、`video.py` 共用的提示词预设，可以自己加 | — |
+| `menu.py` | 命令补全菜单（studio 和视频参数助手共用） | — |
 | `backends.py` | 模型后端：longcat（PyTorch）、z-image-turbo、flux2-klein-4b（mflux/MLX） | 三个都实测过 |
 | `video.py`、`video.json` | 本地视频生成（LTX-2.3）：单镜头和分镜批量，图生视频、运镜预设、拼接成片 | 实测过（video 分支） |
 | `ai.py`、`ai.json` | AI 提示词工具：调用 OpenAI 兼容接口扩写、翻译、看图反推等，可自定义 | 用模拟接口测过，真实接口未测 |
@@ -295,6 +296,29 @@ modelscope download --model mlx-community/gemma-3-12b-it-4bit --local-dir gemma
 ```
 
 拼接成片需要 ffmpeg：`brew install ffmpeg`。
+
+### 参数助手（熟悉参数用）
+
+不确定有哪些参数、每个选项会往提示词里加什么，可以先用助手：
+
+```bash
+.venv-mlx/bin/python video.py assist
+```
+
+```
+video> /camera              ← 不带参数：列出所有运镜和对应的描述
+video> /camera 推进          ← 选择后自动显示当前参数、实际提示词和等价命令行
+video> /style 电影
+video> 橘猫在窗台上伸懒腰      ← 直接输入一句话 = 设为提示词（写动作）
+video> /image                ← 列出最近生成的 10 张图，可直接选作首帧
+video> /show                 ← 查看实际提示词和等价命令行（可以复制下来直接用）
+video> /tips                 ← 视频提示词写法建议
+video> /save 猫咖啡店 S03     ← 存进分镜（关键帧会复制进片目录）
+video> /dry                  ← 打印将要执行的 LTX 命令
+video> /gen                  ← 按当前参数生成
+```
+
+和 studio 一样，输入 `/` 会弹出命令菜单，选中命令后自动弹出参数选项，每一项都附带说明。助手主要用来熟悉参数、拼出命令，熟悉之后直接用下面的命令行或分镜文件更方便。
 
 ### 单个镜头
 

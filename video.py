@@ -19,6 +19,9 @@
   .venv-mlx/bin/python video.py extend 视频.mp4 --seconds 1 -p "猫跳下窗台"            # 往后续写
   .venv-mlx/bin/python video.py extend 视频.mp4 --image 结尾.png                        # 续写到指定画面
 
+参数助手（交互菜单，帮你熟悉各项参数，拼好提示词和命令行）：
+  .venv-mlx/bin/python video.py assist
+
 加 --dry-run 只打印将要执行的命令，不真正生成。
 """
 import argparse
@@ -351,6 +354,250 @@ def concat(clips, out):
     print(f"成片 -> {out}")
 
 
+# ---------------- 参数助手 ----------------
+
+ASSIST_COMMANDS = {
+    "/image": "首帧关键帧（图生视频，画面最可控）",
+    "/end-image": "尾帧关键帧（锁定结尾画面）",
+    "/camera": "运镜",
+    "/motion": "动作幅度",
+    "/ratio": "视频画幅",
+    "/seed": "种子（可多个，空格分隔）",
+    "/seconds": "时长（秒）",
+    "/fps": "帧率",
+    "/style": "风格",
+    "/shot": "景别构图",
+    "/light": "光线",
+    "/tone": "色调氛围",
+    "/time": "时间天气",
+    "/detail": "细节质感（可多选）",
+    "/neg": "负面提示词",
+    "/ai": "生成前用 AI 处理提示词",
+    "/audio": "同时生成音频 on/off",
+    "/show": "查看参数、实际提示词和等价命令行",
+    "/tips": "视频提示词写法建议",
+    "/save": "存进分镜：/save 片名 镜号",
+    "/dry": "打印将要执行的 LTX 命令（不生成）",
+    "/gen": "按当前参数生成（约 2–3 分钟）",
+    "/reset": "清空所有参数",
+    "/help": "命令列表",
+    "/quit": "退出",
+}
+
+ASSIST_TIPS = """  视频提示词写法：
+  · 写“怎么动”，而不是“长什么样”：画面外观交给关键帧（/image），提示词只写动作，如“猫慢慢抬起头”
+  · 一个镜头只写一个简单动作；多个动作拆成多个镜头
+  · 运镜越简单越稳：固定、推进、拉远成功率最高；环绕、跟拍容易出错
+  · LTX 每段 2 秒左右最稳，超过约 4 秒成功率明显下降，长视频靠分镜拼接
+  · 用图生视频时，风格、光线主要由关键帧决定；预设只起辅助作用，最好在 studio 出关键帧时定好
+  · 同一个镜头多试几个种子（/seed 42 43 44），挑最好的一个
+  · 角色要前后一致：在分镜 settings 里写好 character，每个镜头用 {character} 引用"""
+
+NUMERIC_HINTS = {
+    "/seconds": [("2", "默认，LTX 最稳"), ("1", "很短，适合补镜头"), ("3", "稍长，动作可以多一点"),
+                 ("4", "接近上限，成功率下降")],
+    "/fps": [("25", "默认"), ("24", "LTX-2.3 训练时的帧率"), ("16", "更省算力，动作略顿")],
+    "/seed": [("42", "默认"), ("42 43 44", "一次出 3 个挑选")],
+    "/audio": [("off", "默认不生成音频"), ("on", "同时生成环境音")],
+}
+
+
+def assist_choices(cmd):
+    if cmd in ("/image", "/end-image"):
+        pics = []  # 最近生成的图片，方便直接选
+        for root in (os.path.join(HERE, "outputs"), os.path.join(HERE, "projects")):
+            for dirpath, _, files in os.walk(root):
+                pics += [os.path.join(dirpath, f) for f in files if f.endswith(".png") and not f.startswith("key_")]
+        pics.sort(key=os.path.getmtime, reverse=True)
+        return [(os.path.relpath(x, HERE), time.strftime("%m-%d %H:%M", time.localtime(os.path.getmtime(x))))
+                for x in pics[:10]] + [("off", "取消")]
+    if cmd == "/camera":
+        return list(CAMERAS.items()) + [("off", "取消")]
+    if cmd == "/motion":
+        return list(MOTIONS.items()) + [("off", "取消")]
+    if cmd == "/ratio":
+        return [(n, f"{w}x{h}") for n, (w, h) in VIDEO_RATIOS.items()]
+    if cmd == "/neg":
+        return list(NEGATIVES.items()) + [("off", "清除")]
+    if cmd == "/ai":
+        from ai import load_config
+        return [(n, t.get("desc", "")) for n, t in load_config()["tools"].items()
+                if t.get("target") == "prompt" and t.get("input") != "image"] + [("off", "取消")]
+    for key, (c, _, table) in GROUPS.items():
+        if c == cmd:
+            return list(table.items()) + [("off", "取消")]
+    return NUMERIC_HINTS.get(cmd, [])
+
+
+class Assist:
+    KEYS = {"/image": "image", "/end-image": "end_image", "/camera": "camera", "/motion": "motion",
+            "/ratio": "ratio", "/neg": "neg", "/ai": "ai"}
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.job = {}
+
+    def cli_line(self):
+        """等价的 video.py gen 命令行，可以直接复制使用。"""
+        import re
+        import shlex
+
+        def q(x):  # 只有含空格或 shell 特殊字符时才加引号，中文不加
+            x = str(x)
+            return x if re.fullmatch(r"[^\s'\"$`\\!*?&|;<>()\[\]{}#~]+", x) else shlex.quote(x)
+
+        j = self.job
+        parts = [".venv-mlx/bin/python", "video.py", "gen", q(j.get("prompt", "（提示词）"))]
+        for key, flag in (("image", "--image"), ("end_image", "--end-image"), ("ratio", "--ratio"),
+                          ("camera", "--camera"), ("motion", "--motion"), ("seconds", "--seconds"),
+                          ("fps", "--fps"), ("neg", "--neg"), ("ai", "--ai")):
+            if j.get(key) is not None:
+                parts += [flag, q(j[key])]
+        for key in GROUPS:
+            v = j.get(key)
+            if v:
+                parts += [f"--{key}"] + [q(x) for x in (v if isinstance(v, list) else [v])]
+        if j.get("seeds"):
+            parts += ["--seed"] + [str(x) for x in j["seeds"]]
+        if j.get("audio"):
+            parts.append("--audio")
+        return " ".join(parts)
+
+    def show(self):
+        j = self.job
+        w, h = parse_size(j)
+        frames = frames_for(j)
+        fps = int(j.get("fps", DEFAULTS["fps"]))
+        print(f"  画幅 {j.get('ratio') or f'{w}x{h}'} | {frames} 帧 @ {fps}fps（{frames / fps:.2f} 秒）| "
+              f"种子 {j.get('seeds') or DEFAULTS['seeds']} | 音频 {'开' if j.get('audio') else '关'}")
+        print(f"  首帧 {j.get('image') or '-'} | 尾帧 {j.get('end_image') or '-'}")
+        presets = [f"{label} {'+'.join(j[k]) if isinstance(j.get(k), list) else j.get(k)}"
+                   for k, (_, label, _) in GROUPS.items() if j.get(k)]
+        presets += [f"运镜 {j['camera']}"] if j.get("camera") else []
+        presets += [f"动作 {j['motion']}"] if j.get("motion") else []
+        print(f"  预设：{' | '.join(presets) or '-'}")
+        neg = NEGATIVES.get(j.get("neg"), j.get("neg"))
+        print(f"  负面提示词：{neg or '-'}" + (f" | AI：{j['ai']}（生成时执行）" if j.get("ai") else ""))
+        if j.get("prompt"):
+            print(f"  实际提示词：{compose(dict(j, ai=None))}")
+        else:
+            print("  还没有提示词：直接输入一句描述动作的话")
+        print(f"  等价命令行：\n    {self.cli_line()}")
+
+    def save(self, arg):
+        parts = arg.split()
+        if len(parts) != 2 or not self.job.get("prompt"):
+            print("  用法：/save 片名 镜号（先输入提示词），例如 /save 猫咖啡店 S03")
+            return
+        name, sid = parts
+        proj = os.path.join(HERE, "projects", name)
+        os.makedirs(proj, exist_ok=True)
+        path = os.path.join(proj, "storyboard.json")
+        board = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else \
+            {"settings": {"character": "", "scene": "", "ratio": "横屏", "fps": 25, "seconds": 2, "seeds": [42]},
+             "shots": []}
+        shot = {k: v for k, v in self.job.items() if v not in (None, [], "")}
+        shot["id"] = sid
+        for key in ("image", "end_image"):  # 关键帧复制进片目录，分镜里用相对路径
+            if shot.get(key):
+                dst = os.path.join(proj, f"{sid}{'_end' if key == 'end_image' else ''}.png")
+                shutil.copyfile(os.path.join(HERE, shot[key]) if not os.path.isabs(shot[key]) else shot[key], dst)
+                shot[key] = os.path.basename(dst)
+        board["shots"] = [x for x in board["shots"] if x.get("id") != sid] + [shot]
+        board["shots"].sort(key=lambda x: x.get("id", ""))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(board, f, ensure_ascii=False, indent=2)
+        print(f"  已存为 {os.path.relpath(path, HERE)} 的 {sid}（共 {len(board['shots'])} 个镜头）")
+        print(f"  生成：.venv-mlx/bin/python video.py board {os.path.relpath(path, HERE)} --only {sid}")
+
+    def command(self, line):
+        cmd, _, arg = line.partition(" ")
+        arg = arg.strip()
+        j = self.job
+        if cmd in self.KEYS or any(cmd == c for c, _, _ in GROUPS.values()):
+            key = self.KEYS.get(cmd) or next(k for k, (c, _, _) in GROUPS.items() if c == cmd)
+            if not arg:  # 列出选项，帮助熟悉
+                for value, desc in assist_choices(cmd):
+                    print(f"  {value:<8} {desc}")
+                return
+            if arg == "off":
+                j.pop(key, None)
+            elif key in MULTI:
+                cur = j.get(key) or []
+                j[key] = [x for x in cur if x != arg] if arg in cur else cur + [arg]
+            else:
+                if key in ("image", "end_image") and not os.path.exists(os.path.join(HERE, arg)) \
+                        and not os.path.exists(arg):
+                    print(f"  找不到图片：{arg}")
+                    return
+                valid = dict(assist_choices(cmd))
+                if key not in ("image", "end_image", "neg") and arg not in valid:
+                    print(f"  没有“{arg}”这个选项，输入 {cmd} 查看列表")
+                    return
+                j[key] = arg
+            self.show()
+        elif cmd == "/seconds":
+            j["seconds"] = float(arg)
+            self.show()
+        elif cmd == "/fps":
+            j["fps"] = int(arg)
+            self.show()
+        elif cmd == "/seed":
+            j["seeds"] = [int(x) for x in arg.split()]
+            self.show()
+        elif cmd == "/audio":
+            j["audio"] = arg == "on"
+            self.show()
+        elif cmd == "/show":
+            self.show()
+        elif cmd == "/tips":
+            print(ASSIST_TIPS)
+        elif cmd == "/save":
+            self.save(arg)
+        elif cmd in ("/dry", "/gen"):
+            if not j.get("prompt"):
+                print("  先输入提示词")
+                return
+            job = dict(j)  # 在副本上补全路径，不改动助手里的参数
+            for key in ("image", "end_image"):
+                if job.get(key) and not os.path.isabs(job[key]):
+                    job[key] = os.path.join(HERE, job[key])
+            run_job(self.cfg, job, OUT_DIR, dry=cmd == "/dry")
+        elif cmd == "/reset":
+            self.job = {}
+            self.show()
+        elif cmd in ("/help", "/?"):
+            for c, d in ASSIST_COMMANDS.items():
+                print(f"  {c:<11} {d}")
+        else:
+            print("  未知命令，/help 查看")
+
+    def loop(self):
+        from menu import make_prompt_session
+        print("视频参数助手：帮你熟悉各项参数，拼出提示词和命令行。")
+        print("  直接输入一句话 = 设为提示词（写动作）；输入 / 弹出命令菜单，每个选项都有说明；/tips 查看写法建议")
+        read = make_prompt_session(ASSIST_COMMANDS, assist_choices, os.path.join(OUT_DIR, ".assist_history"), "video")
+        read = read or (lambda: input("\nvideo> "))
+        while True:
+            try:
+                line = read().strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not line:
+                continue
+            if line in ("/quit", "/exit", "/q"):
+                break
+            try:
+                if line.startswith("/"):
+                    self.command(line)
+                else:
+                    self.job["prompt"] = line
+                    self.show()
+            except (SystemExit, Exception) as e:  # 参数校验失败也不退出助手
+                print(f"  {e}")
+
+
 # ---------------- 命令行 ----------------
 
 def add_job_args(p):
@@ -408,6 +655,7 @@ def main():
     add_edit_args(e)
     e.add_argument("--seconds", type=float, help="续写秒数（默认 2）")
     e.add_argument("--image", help="续写结尾要到达的画面")
+    sub.add_parser("assist", help="参数助手：交互菜单熟悉各项参数")
     i = sub.add_parser("init", help="在目录里生成分镜模板")
     i.add_argument("project_dir")
     a = ap.parse_args()
@@ -423,6 +671,9 @@ def main():
         return
 
     cfg = load_cfg()
+    if a.cmd == "assist":
+        Assist(cfg).loop()
+        return
     if a.cmd in ("retake", "extend"):
         edit_job(cfg, a, a.cmd)
         return
