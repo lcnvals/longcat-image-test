@@ -630,6 +630,12 @@ def edit_concat(items, out, edit, settings=None, base=None):
         length = (b - a) / speed
         vf = [f"trim=start={a}:end={b}", f"setpts=(PTS-STARTPTS)/{speed}", f"fps={fps}",
               f"scale={tw}:{th}:force_original_aspect_ratio=increase", f"crop={tw}:{th}", "setsar=1"]
+        if job.get("shake") and job.get("mode") != "still":
+            # 震屏：命中/释放的瞬间（镜头开头 0.4 秒）画面抖动，漫剧镜头在渲染时已经处理
+            amp = 10
+            vf += [f"crop={tw - 2 * amp}:{th - 2 * amp}:"
+                   f"x='{amp}+if(lt(t,0.4),{amp}*sin(t*90),0)':y='{amp}+if(lt(t,0.4),{amp}*cos(t*110),0)'",
+                   f"scale={tw}:{th}"]
         if job.get("line") and job.get("mode") != "still":
             # 台词比画面长：最后一帧定格到念完，避免台词被下一镜或片尾截断
             import postprod
