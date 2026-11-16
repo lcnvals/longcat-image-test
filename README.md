@@ -11,6 +11,9 @@ LongCat 的官方示例针对 CUDA，并用 `enable_model_cpu_offload()` 节省�
 | `edit.py` | LongCat-Image-Edit-Turbo 改图（照片 + 指令） | 未实测 |
 | `presets.py` | `studio.py`、`video.py` 共用的提示词预设，可以自己加 | — |
 | `menu.py` | 命令补全菜单（studio 和视频参数助手共用） | — |
+| `assets.py` | 角色/怪物/场景定义与设定图 | 实测过 |
+| `postprod.py` | 漫剧镜头、配音、字幕、音效、背景声与混音 | 实测过 |
+| `video_api.py` | 商用视频 API（阿里云百炼 Wan） | 模拟接口测过，未用真实密钥 |
 | `backends.py` | 模型后端：longcat（PyTorch）、z-image-turbo、flux2-klein-4b（mflux/MLX） | 三个都实测过 |
 | `video.py`、`video.json` | 本地视频生成（LTX-2.3）：单镜头和分镜批量，图生视频、运镜预设、拼接成片 | 实测过（video 分支） |
 | `deploy/setup_cuda.sh`、`video_cuda.py` | Linux + NVIDIA 一键部署与 CUDA 视频运行器 | 未在真实 GPU 上测试 |
@@ -360,6 +363,117 @@ video> /gen                  ← 按当前参数生成
 ```
 
 `storyboard.json` 由全片设置 `settings` 和镜头列表 `shots` 组成：镜头里的字段会覆盖全片设置；`{character}`、`{scene}` 会替换成设定里的角色和场景描述（保证每个镜头的描述一字不差）；`image` 是关键帧路径（相对分镜文件）；`pick` 指定拼接时用哪个种子。每个镜头输出到 `projects/<片名>/<镜号>/`。改了某个镜头只需要重跑它，没改的镜头会自动跳过。
+
+### 定义：角色、怪物、场景（assets.py）
+
+角色、怪物、场景定义一次，所有镜头和项目都引用。每个定义 = 外观描述 + 设定图 + 音色：
+
+```bash
+.venv-mlx/bin/python assets.py new 红带武士 --kind character --style 游戏CG \
+  --desc "一名年轻武士，黑色短发，额头系着红色发带，身穿白色内衬和深蓝色轻甲，手持一把长太刀" \
+  --must 红色发带 深蓝色轻甲 --voice Tingting
+.venv-mlx/bin/python assets.py sheet 红带武士      # 按定义生成设定图：角色是正面/侧面/背面/战斗姿态
+.venv-mlx/bin/python assets.py list                 # 列出所有定义
+.venv-mlx/bin/python assets.py show 红带武士        # 查看描述、必须特征、音色、设定图
+```
+
+定义存在 `assets/<类别>/<名字>/definition.json`（类别：characters、monsters、scenes、props）：
+
+| 字段 | 作用 |
+|---|---|
+| `desc` | 外观描述，每个镜头原样引用 |
+| `must` | 必须保持的特征，会追加到描述后面 |
+| `avoid` | 不该出现的特征；**只在支持负面提示词的模型里生效**。在正面提示词里写“不要出现四肢”反而会画出四肢，所以不支持负面提示词的模型请在 `desc` 里用正面描述（如“蛇形身躯盘绕在地面上”） |
+| `voice` | 这个角色说台词用的音色（见下文“声音”） |
+| `display_name` | 字幕里显示的名字 |
+| `sheets` | 要生成哪些设定图、各自的画面要求和尺寸 |
+
+分镜里用 `cast` 引用，镜头描述里写 `{hero}` 等占位符：
+
+```json
+"settings": {"cast": {"hero": "红带武士", "monster": "八岐大蛇", "scene": "火山峡谷"}, "ref_images": 1},
+"shots": [{"id": "S04", "keyframe": "{scene}，{hero}挥刀砍在{monster}的鳞片上", "prompt": "太刀砍在鳞片上迸出火花"}]
+```
+
+`video.py keyframes` 出关键帧时，会自动把这个镜头里出场的定义的设定图作为参考（每个定义取 `ref_images` 张），用支持参考图的 FLUX.2 klein 生成，外观更一致；`--no-refs` 关闭。
+
+### 批量关键帧
+
+镜头里写 `keyframe`（静态画面描述）后，可以批量出关键帧，不用在 studio 里一张张出：
+
+```bash
+.venv-mlx/bin/python video.py keyframes projects/八岐大蛇/storyboard.json                       # 缺的才出
+.venv-mlx/bin/python video.py keyframes projects/八岐大蛇/storyboard.json --only S04 --seed 42 43  # 重出，多个种子
+```
+
+多个种子都会保存为 `<镜号>_kf_s<种子>.png`，第一个作为当前关键帧；想换就把 `<镜号>_kf_s43.png` 复制成 `<镜号>.png`。`keyframe` 写静态画面（长什么样），`prompt` 写动作（怎么动）。
+
+### 镜头衔接
+
+| 镜头字段 | 作用 | 适合 |
+|---|---|---|
+| `"start_from": "prev"` | 用上一镜（选用种子）的**最后一帧**作首帧 | 同一空间里的连续动作，如跃起 → 刺下 |
+| `"end_to": "next"` | 用下一镜的关键帧作尾帧 | 让这一镜“走到”下一镜开头的画面 |
+
+上一镜重新生成后，接力的镜头会被识别出来自动重新生成。
+
+### 剪辑：节奏、转场、补帧
+
+拼接成片时可以设置剪辑参数（只用 ffmpeg，十几秒完成，不用重新生成）：
+
+| 镜头字段 | 作用 |
+|---|---|
+| `speed` | 变速倍数，几乎不动的镜头加速（如 1.6） |
+| `trim` | `[开始秒, 结束秒]`，剪掉有瑕疵的部分 |
+| `in` | 开头转场：`cut`（默认）、`flash`（闪白，适合打击瞬间，自动配打击音效）、`fade`（从黑场淡入） |
+| `out` | 结尾转场：`cut`、`fade`（淡出到黑场） |
+
+`settings.edit`：`fps` 输出帧率、`smooth` 补帧到的帧率（如 50，让动作更顺滑）、`fade_in` / `fade_out` 全片开头和结尾的淡入淡出秒数。成片文件名用 `--output` 指定。
+
+### 漫剧镜头：静态图推拉
+
+不是每个镜头都需要视频模型。镜头写 `"mode": "still"`，就用关键帧做推拉平移（几秒完成，视频镜头要几分钟），适合开场、空镜、对话、特写：
+
+```json
+{"id": "S01", "mode": "still", "camera": "推进", "line": "传说中，火山深处沉睡着八岐大蛇。"}
+```
+
+运镜：推进、拉远、左移、右移、上摇、固定、手持（轻微晃动）；`"shake": true` 加打击震动。有台词时镜头自动延长到念完。视频镜头、漫剧镜头、API 生成的视频可以混剪，拼接时统一缩放到分镜尺寸。
+
+### 声音：配音、字幕、音效、背景声
+
+| 镜头字段 | 作用 |
+|---|---|
+| `line` | 旁白或台词：合成配音并生成字幕 |
+| `speaker` | 说话的角色（`cast` 里的键）：用该角色定义里的 `voice`，字幕前加角色名，如“武士：就是现在！” |
+| `voice` | 单独指定这句的音色 |
+| `sfx` | 音效：`impact`（打击）、`whoosh`（风声）或音频文件路径；闪白转场默认带 `impact` |
+
+```json
+"settings": {
+  "tts": {"engine": "say", "voice": "Tingting", "rate": 185},
+  "audio": {"bgm": "rain", "bgm_volume": 0.3, "subtitles": true, "subtitle_speaker": true}
+}
+```
+
+- 配音目前用 macOS 自带的 `say`，普通话可用 `Tingting`。列表里的 `Eddy`、`Flo` 等音色如果没下载语音数据会输出空音频，程序会报错提示。更多音色在“系统设置 → 辅助功能 → 朗读内容 → 系统声音”里下载。
+- `bgm` 可以是内置的 `rain`（程序生成的雨声），也可以是音乐文件路径（自动循环）。旁白出现时背景声会自动压低。
+- 打击、风声和雨声都是程序生成的占位音效，换成真实素材效果更好。
+
+### 商用视频 API（阿里云百炼 Wan）
+
+需要量产或更强的动作效果时，可以把视频镜头交给云端的通义万相（Wan 2.7）图生视频：
+
+```bash
+export DASHSCOPE_API_KEY=你的百炼 API Key       # 百炼控制台创建；密钥、地域、模型要一致
+.venv-mlx/bin/python video.py board projects/八岐大蛇/storyboard.json --only S08 --backend api
+```
+
+- 支持首帧、尾帧、负面提示词、种子；时长 2–15 秒（按镜头的 `seconds` 取整），分辨率在 `video.json` 的 `api` 段设置（默认 720P）。
+- 提交任务后每 15 秒查询一次，完成后立刻下载（官方视频链接只保留 24 小时）。
+- **按生成的视频秒数计费，失败不计费**，价格以百炼控制台为准。
+- 其他地域（如新加坡）修改 `api.base_url`。可灵、海螺、即梦等暂未接入（官方文档未能读取到）。
+- 以上在本地用模拟接口测试过，尚未用真实密钥调用。
 
 ### 局部修改：只重做一段 / 往后续写
 

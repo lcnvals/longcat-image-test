@@ -1,6 +1,13 @@
 {
   "_说明": "视频后端配置。本机路径不同就新建 video.local.json 覆盖同名项（不进仓库）。",
-  "_backend": "不写 backend 时自动选择：Mac 用 mlx（ltx 段），Linux 用 cuda（cuda 段）",
+  "_backend": "不写 backend 时自动选择：Mac 用 mlx（ltx 段），Linux 用 cuda（cuda 段）；api 用百炼 Wan（api 段，按秒计费）",
+  "api": {
+    "_说明": "商用视频 API：阿里云百炼 Wan 图生视频。密钥放环境变量；base_url、密钥、模型要同一地域",
+    "model": "wan2.7-i2v-2026-04-25",
+    "resolution": "720P",
+    "base_url": "https://dashscope.aliyuncs.com",
+    "api_key_env": "DASHSCOPE_API_KEY"
+  },
   "cuda": {
     "python": "./.venv-cuda/bin/python",
     "model": "./models/ltx-2",

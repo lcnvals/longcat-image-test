@@ -12,3 +12,4 @@ models/
 video.local.json
 projects/
 .venv-cuda/
+assets/**/*.png

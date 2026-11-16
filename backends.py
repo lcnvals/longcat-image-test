@@ -42,6 +42,7 @@ class Backend:
     default_size = "768x768"
     cfg = None               # 默认 CFG；None 表示模型不支持（蒸馏模型）
     supports_neg = False     # 是否支持负面提示词
+    supports_refs = False    # 是否支持参考图生图（generate_refs）
     out_dir = "./outputs"
 
     def generate(self, prompt, neg, w, h, steps, seed, cfg, init=None, strength=None):
@@ -171,6 +172,7 @@ class MfluxBackend(Backend):
         if not os.path.isdir(path):
             raise SystemExit(f"找不到模型目录 {path}，先按 README 从魔搭下载")
         t0 = time.time()
+        self.path, self.q = path, q
         self.model = self.load(path, q)
         self.out_dir = f"./outputs/{self.key}"
         print(f"  {self.title} 加载完成（{q}-bit）{time.time() - t0:.0f}s")
@@ -211,6 +213,17 @@ class Flux2KleinBackend(MfluxBackend):
     key = "flux2-klein-4b"
     title = "FLUX.2 klein 4B（MLX）"
     preview_steps = final_steps = 4
+    supports_refs = True
+
+    def generate_refs(self, prompt, refs, w, h, steps, seed):
+        """以设定图为参考生成（多参考图编辑模式）。mflux 按需加载权重，只用这个方法时不会多占内存。"""
+        if not hasattr(self, "edit"):
+            from mflux.models.common.config import ModelConfig
+            from mflux.models.flux2.variants import Flux2KleinEdit
+            self.edit = Flux2KleinEdit(quantize=self.q, model_path=self.path, model_config=ModelConfig.flux2_klein_4b())
+        result = self.edit.generate_image(seed=seed, prompt=prompt, num_inference_steps=steps,
+                                          height=h, width=w, image_paths=list(refs))
+        return result.image
 
     def load(self, path, q):
         from mflux.models.common.config import ModelConfig

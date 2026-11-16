@@ -169,7 +169,28 @@ def cuda_command(cfg, job, prompt, seed, w, h, frames, out):
     return cmd
 
 
+def api_command(cfg, job, prompt, seed, w, h, frames, out):
+    """商用视频 API（阿里云百炼 Wan 图生视频）：调用 video_api.py。按秒计费。"""
+    c = cfg.get("api", {})
+    if not job.get("_image"):
+        raise SystemExit("Wan 图生视频需要首帧：给镜头加 image / keyframe，或用 --image")
+    fps = int(job.get("fps", DEFAULTS["fps"]))
+    seconds = max(2, min(15, round(frames / fps)))
+    cmd = [sys.executable, os.path.join(HERE, "video_api.py"), "-p", prompt, "-o", out, "--image", job["_image"],
+           "--duration", str(seconds), "--seed", str(seed), "--resolution", c.get("resolution", "720P"),
+           "--model", c.get("model", "wan2.7-i2v-2026-04-25"), "--base-url", c.get("base_url", "https://dashscope.aliyuncs.com"),
+           "--key-env", c.get("api_key_env", "DASHSCOPE_API_KEY")]
+    if job.get("_end_image"):
+        cmd += ["--end-image", job["_end_image"]]
+    neg = NEGATIVES.get(job.get("neg"), job.get("neg"))
+    if neg:
+        cmd += ["--negative", neg]
+    return cmd
+
+
 def ltx_command(cfg, job, prompt, seed, w, h, frames, out):
+    if cfg.get("backend") == "api":
+        return api_command(cfg, job, prompt, seed, w, h, frames, out)
     if cfg.get("backend") == "cuda":
         return cuda_command(cfg, job, prompt, seed, w, h, frames, out)
     ltx = cfg.get("ltx", {})
@@ -273,7 +294,7 @@ def latent_range_seconds(start, end, fps):
 
 
 def edit_job(cfg, a, kind):
-    if cfg.get("backend") == "cuda":
+    if cfg.get("backend") in ("cuda", "api"):
         raise SystemExit(f"{kind} 目前只支持 Mac 上的 LTX-2.3（ltx-2-mlx）；CUDA 后端可以用 --only 重做整个镜头")
     video = a.video
     if not os.path.exists(video):
@@ -335,6 +356,62 @@ def edit_job(cfg, a, kind):
 
 # ---------------- 分镜 ----------------
 
+def last_frame(video_path, out_png):
+    """取视频最后一帧存成图片（镜头接力用）。"""
+    ffmpeg = ffmpeg_bin()
+    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-sseof", "-0.2", "-i", video_path, "-update", "1",
+                    "-frames:v", "1", out_png], check=True)
+    return out_png
+
+
+def picked_clip(base, job):
+    """分镜里某个镜头被选用（pick）的视频路径。漫剧镜头（mode=still）没有种子。"""
+    if job.get("mode") == "still":
+        w, h = parse_size(job)
+        return os.path.join(base, job["id"], f"{job['id']}_still_{w}x{h}.mp4")
+    seed = job.get("pick", (job.get("seeds") or DEFAULTS["seeds"])[0])
+    w, h = parse_size(job)
+    tag = "_i2v" if job.get("image") or job.get("start_from") else ""
+    return os.path.join(base, job["id"], f"{job['id']}_s{seed}_{frames_for(job)}f_{w}x{h}{tag}.mp4")
+
+
+def render_still_shot(base, job):
+    """漫剧镜头：关键帧推拉平移；有台词时自动延长到念完。"""
+    import postprod
+    if not job.get("image") or not os.path.exists(job["image"]):
+        raise SystemExit(f"{job['id']} 是漫剧镜头，需要关键帧图片（image）")
+    w, h = parse_size(job)
+    fps = int(job.get("fps", DEFAULTS["fps"]))
+    seconds = float(job.get("seconds", DEFAULTS["seconds"]))
+    if job.get("line"):
+        _, dur = postprod.tts(job["line"], os.path.join(base, "audio"), postprod.voice_cfg(job), job.get("voice"))
+        seconds = max(seconds, dur + 0.5)
+    out = picked_clip(base, job)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    t0 = time.time()
+    postprod.render_still(job["image"], out, w, h, seconds, fps, job.get("camera"), job.get("shake"))
+    print(f"  漫剧镜头：{seconds:.2f} 秒，运镜 {job.get('camera') or '固定'} -> {os.path.relpath(out, HERE)}"
+          f"  ({time.time() - t0:.0f}s)")
+
+
+def link_shots(base, jobs, i):
+    """镜头衔接：start_from=prev 用上一镜最后一帧作首帧；end_to=next 用下一镜关键帧作尾帧。"""
+    job = jobs[i]
+    if job.get("start_from") == "prev":
+        if i == 0:
+            raise SystemExit(f"{job['id']} 是第一个镜头，没有上一镜可以接力")
+        prev = picked_clip(base, jobs[i - 1])
+        if not os.path.exists(prev):
+            raise SystemExit(f"{job['id']} 要接力 {jobs[i - 1]['id']}，但还没有它的视频：{prev}（先生成上一镜）")
+        os.makedirs(os.path.join(base, job["id"]), exist_ok=True)
+        job["image"] = last_frame(prev, os.path.join(base, job["id"], f"from_{jobs[i - 1]['id']}.png"))
+        print(f"  接力：首帧取自 {jobs[i - 1]['id']} 的最后一帧")
+    if job.get("end_to") == "next":
+        if i == len(jobs) - 1 or not jobs[i + 1].get("image"):
+            raise SystemExit(f"{job['id']} 要对准下一镜，但下一镜没有关键帧")
+        job["end_image"] = jobs[i + 1]["image"]
+        print(f"  对准：尾帧取自 {jobs[i + 1]['id']} 的关键帧")
+
 TEMPLATE = {
     "settings": {
         "_说明": "全片通用设置；镜头里同名字段会覆盖这里。{character}、{scene} 会被替换成下面的设定。",
@@ -352,7 +429,7 @@ TEMPLATE = {
 }
 
 
-REF_KEYS = ("character", "scene", "refs")
+REF_KEYS = ("character", "scene", "refs", "cast", "ref_images", "keyframe_ref_model")
 
 
 def fill_refs(text, settings):
@@ -369,13 +446,33 @@ def load_board(path):
         board = json.load(f)
     base = os.path.dirname(os.path.abspath(path))
     settings = {k: v for k, v in board.get("settings", {}).items() if not k.startswith("_")}
+    cast_imgs, cast_voices = {}, {}
+    if settings.get("cast"):  # 引用 assets/ 里的定义：描述文字 + 设定图
+        sys.path.insert(0, HERE)
+        import assets
+        cast_texts, cast_imgs, cast_voices = assets.resolve_cast(settings["cast"], with_voice=True)
+        settings["refs"] = {**cast_texts, **(settings.get("refs") or {})}  # refs 里写的同名项优先
+    per_asset = int(settings.get("ref_images", 1))
     jobs = []
     for shot in board["shots"]:
         job = {k: v for k, v in settings.items() if k not in REF_KEYS}
         job.update({k: v for k, v in shot.items() if not k.startswith("_")})
-        job["prompt"] = fill_refs(job["prompt"], settings)
+        job["prompt"] = fill_refs(job.get("prompt", ""), settings)  # 漫剧镜头可以不写
+        if job.get("speaker"):  # 台词跟随角色：用角色定义里的音色，字幕可带上角色名
+            sp = cast_voices.get(job["speaker"])
+            if sp is None:
+                raise SystemExit(f"{shot['id']} 的 speaker“{job['speaker']}”不在 cast 里：{'、'.join(cast_voices) or '无'}")
+            job["_speaker_name"] = sp["name"]
+            if sp.get("voice") and not shot.get("voice"):
+                job["_voice_cfg"] = sp["voice"]
         if job.get("keyframe"):
-            job["keyframe"] = fill_refs(job["keyframe"], settings)
+            raw_kf = job["keyframe"]
+            # 这个镜头出现了哪些定义（按在描述里出现的顺序），各取前 per_asset 张设定图作为参考
+            used = sorted((k for k in cast_imgs if "{" + k + "}" in raw_kf), key=lambda k: raw_kf.index("{" + k + "}"))
+            job["_cast"] = used
+            n = int(shot.get("ref_images", per_asset))  # 镜头里可以单独指定每个定义用几张设定图
+            job["_refs"] = [img for k in used for img in cast_imgs[k][:n]]
+            job["keyframe"] = fill_refs(raw_kf, settings)
         for key in ("image", "end_image"):
             if job.get(key) and not os.path.isabs(job[key]):
                 job[key] = os.path.join(base, job[key])
@@ -383,13 +480,18 @@ def load_board(path):
     return base, jobs
 
 
-def gen_keyframes(path, only=None, model=None, quantize=None, seeds=None, force=False):
-    """按分镜里每个镜头的 keyframe（静态画面描述）批量出关键帧，写回 image 字段。"""
+def gen_keyframes(path, only=None, model=None, quantize=None, seeds=None, force=False, use_refs=True):
+    """按分镜里每个镜头的 keyframe（静态画面描述）批量出关键帧，写回 image 字段。
+
+    分镜用 cast 引用了定义、且定义有设定图时，用支持参考图的模型（默认 FLUX.2 klein）以设定图为参考出图。
+    """
     base, jobs = load_board(path)
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
     settings = raw.get("settings", {})
-    model = model or settings.get("keyframe_model", "z-image-turbo")
+    has_refs = use_refs and any(j.get("_refs") for j in jobs if j.get("keyframe") and (not only or j["id"] in only))
+    model = model or (settings.get("keyframe_ref_model", "flux2-klein-4b") if has_refs
+                      else settings.get("keyframe_model", "z-image-turbo"))
     todo = [j for j in jobs if j.get("keyframe") and (not only or j["id"] in only)]
     todo = [j for j in todo if force or only or not os.path.exists(os.path.join(base, f"{j['id']}.png"))]
     if not todo:
@@ -399,21 +501,31 @@ def gen_keyframes(path, only=None, model=None, quantize=None, seeds=None, force=
     from backends import BACKENDS
     print(f"加载 {BACKENDS[model].title} ...")
     backend = BACKENDS[model](quantize=quantize)
+    if has_refs and not backend.supports_refs:
+        print(f"  注意：{backend.title} 不支持参考图，这次只用文字描述（换 --model flux2-klein-4b 可以用设定图）")
     for job in todo:
         w, h = parse_size(job)
         kw, kh = map(int, str(job.get("keyframe_size") or f"{w * 3 // 2}x{h * 3 // 2}").split("x"))
         prompt = compose(dict(job, prompt=job["keyframe"], camera=None, motion=None, ai=None))
         shot_seeds = seeds or job.get("keyframe_seeds") or [job.get("keyframe_seed", 42)]
+        refs = job.get("_refs") if use_refs and backend.supports_refs else []
         print(f"\n== {job['id']}  {kw}x{kh}  种子 {shot_seeds}\n  {prompt}")
+        if refs:
+            print("  参考设定图：" + "、".join(os.path.relpath(r, HERE) for r in refs))
+        tag = "_ref" if refs else ""
         for seed in shot_seeds:
             t0 = time.time()
-            img, _ = backend.generate(prompt, "", kw, kh, backend.final_steps, seed, backend.cfg)
-            out = os.path.join(base, f"{job['id']}_kf_s{seed}.png")
+            if refs:
+                img = backend.generate_refs(prompt + "，人物和怪物的外观与参考图保持一致", refs, kw, kh,
+                                            backend.final_steps, seed)
+            else:
+                img, _ = backend.generate(prompt, "", kw, kh, backend.final_steps, seed, backend.cfg)
+            out = os.path.join(base, f"{job['id']}_kf_s{seed}{tag}.png")
             img.save(out)
             backend.cleanup()
             print(f"  -> {os.path.relpath(out, HERE)}  ({time.time() - t0:.0f}s)")
         # 第一个种子作为当前关键帧；想换就把 image 改成其他 _kf_sN.png
-        chosen = f"{job['id']}_kf_s{shot_seeds[0]}.png"
+        chosen = f"{job['id']}_kf_s{shot_seeds[0]}{tag}.png"
         shutil.copyfile(os.path.join(base, chosen), os.path.join(base, f"{job['id']}.png"))
         for shot in raw["shots"]:
             if shot.get("id") == job["id"]:
@@ -421,6 +533,95 @@ def gen_keyframes(path, only=None, model=None, quantize=None, seeds=None, force=
                 shot["_keyframe_from"] = chosen
         with open(path, "w", encoding="utf-8") as f:
             json.dump(raw, f, ensure_ascii=False, indent=2)
+
+
+def ffmpeg_bin():
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError:
+            raise SystemExit("没有找到 ffmpeg：Mac 用 brew install ffmpeg，Linux 用 apt install -y ffmpeg")
+    return ffmpeg
+
+
+EDIT_KEYS = ("speed", "trim", "in", "out")
+
+
+def edit_concat(items, out, edit, settings=None, base=None):
+    """带剪辑的拼接：每个镜头先单独处理（截取、变速、闪白/淡入淡出），再拼接，可选补帧。
+
+    items: [(视频路径, 镜头参数)]，镜头参数里可以有：
+      speed  变速倍数（>1 加快），trim [开始秒, 结束秒]（按原视频时间），
+      in     开头转场：cut（默认）/ flash（闪白，适合打击瞬间）/ fade（从黑场淡入）
+      out    结尾转场：cut（默认）/ fade（淡出到黑场）
+    edit（分镜 settings.edit）：fps 输出帧率（默认 25），smooth 补帧到的帧率（如 50，不填不补帧），
+      fade_in / fade_out 全片开头淡入、结尾淡出的秒数
+    """
+    ffmpeg = ffmpeg_bin()
+    tmp = out[:-4] + "_parts"
+    os.makedirs(tmp, exist_ok=True)
+    fps = int(edit.get("fps", 25))
+    tw, th = parse_size(items[0][1])  # 统一缩放到分镜尺寸：本地视频、API 视频、漫剧镜头可以混剪
+    parts, total, timeline = [], 0.0, []
+    for idx, (clip, job) in enumerate(items):
+        frames, cfps, _, _, _ = probe(clip)
+        dur = (frames - 1) / cfps
+        a, b = job.get("trim") or [0, dur]
+        b = min(b, dur)
+        speed = float(job.get("speed", 1.0))
+        length = (b - a) / speed
+        vf = [f"trim=start={a}:end={b}", f"setpts=(PTS-STARTPTS)/{speed}", f"fps={fps}",
+              f"scale={tw}:{th}:force_original_aspect_ratio=increase", f"crop={tw}:{th}", "setsar=1"]
+        fin = job.get("in", "cut")
+        if idx == 0 and edit.get("fade_in"):
+            fin = "fade"
+        if fin == "flash":
+            vf.append("fade=t=in:st=0:d=0.15:color=white")
+        elif fin == "fade":
+            vf.append(f"fade=t=in:st=0:d={edit.get('fade_in', 0.4)}")
+        fout = job.get("out", "cut")
+        if idx == len(items) - 1 and edit.get("fade_out"):
+            fout = "fade"
+        if fout == "fade":
+            d = float(edit.get("fade_out", 0.6))
+            vf.append(f"fade=t=out:st={max(0, length - d):.3f}:d={d}")
+        part = os.path.join(tmp, f"{idx:02d}.mp4")
+        rc = subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", clip, "-an", "-vf", ",".join(vf),
+                             "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", part]).returncode
+        if rc != 0:
+            raise SystemExit(f"处理 {clip} 失败")
+        parts.append(part)
+        timeline.append((total, length, job))
+        total += length
+        print(f"  {os.path.basename(clip)}：截取 {a:.2f}–{b:.2f} 秒，{speed:g} 倍速 → {length:.2f} 秒，"
+              f"开头 {fin}，结尾 {fout}")
+    lst = os.path.join(tmp, "list.txt")
+    with open(lst, "w", encoding="utf-8") as f:
+        f.writelines(f"file '{os.path.abspath(p)}'\n" for p in parts)
+    settings = settings or {}
+    post = settings.get("audio") or any(j.get("line") or j.get("sfx") or j.get("in") == "flash" for _, _, j in timeline)
+    joined = os.path.join(tmp, "joined.mp4")
+    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", joined],
+                   check=True)
+    video_only = joined
+    if edit.get("smooth"):  # 运动补帧，让动作更顺滑
+        print(f"  补帧到 {edit['smooth']}fps（需要一两分钟）...", flush=True)
+        video_only = os.path.join(tmp, "smooth.mp4")
+        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", joined, "-vf",
+                        f"minterpolate=fps={edit['smooth']}:mi_mode=mci:mc_mode=aobmc:vsbmc=1",
+                        "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", video_only], check=True)
+    if post:
+        import postprod
+        w, h = parse_size(items[0][1])
+        print("  加配音、字幕、音效和背景声...", flush=True)
+        postprod.finish(video_only, out, timeline, dict(settings, _size=f"{w}x{h}"),
+                        os.path.join(base or tmp, "audio"))
+    else:
+        shutil.copyfile(video_only, out)
+    shutil.rmtree(tmp)
+    print(f"成片 -> {out}（{total:.1f} 秒）")
 
 
 def concat(clips, out):
@@ -710,6 +911,7 @@ def add_job_args(p):
     p.add_argument("--audio", action="store_true", help="同时生成音频（默认关闭）")
     p.add_argument("--no-low-ram", dest="low_ram", action="store_false", default=None,
                    help="关闭低内存模式（内存充足时更快）")
+    p.add_argument("--backend", choices=["mlx", "cuda", "api"], help="视频后端：mlx（Mac 本地）/ cuda（NVIDIA）/ api（百炼 Wan，按秒计费）")
     p.add_argument("--dry-run", action="store_true", help="只打印命令，不生成")
 
 
@@ -723,7 +925,10 @@ def main():
     b = sub.add_parser("board", help="按分镜文件批量生成")
     b.add_argument("storyboard")
     b.add_argument("--only", nargs="+", help="只生成这些镜头，如 S02 S05")
-    b.add_argument("--concat", action="store_true", help="生成后按镜头顺序拼接成片（用每个镜头的 pick 种子）")
+    b.add_argument("--concat", action="store_true", help="生成后按镜头顺序拼接成片（用每个镜头的 pick 种子）；"
+                   "镜头或 settings.edit 里有剪辑参数时按剪辑参数处理")
+    b.add_argument("--output", help="成片文件名（默认 final.mp4）")
+    b.add_argument("--backend", choices=["mlx", "cuda", "api"], help="视频后端（覆盖 video.json）")
     b.add_argument("--dry-run", action="store_true")
     def add_edit_args(p):
         p.add_argument("video")
@@ -751,6 +956,7 @@ def main():
     k.add_argument("--quantize", type=int)
     k.add_argument("--seed", dest="seeds", type=int, nargs="+", help="覆盖种子；多个种子都会出图，第一个作为当前关键帧")
     k.add_argument("--force", action="store_true", help="已有关键帧也重新生成")
+    k.add_argument("--no-refs", dest="use_refs", action="store_false", help="不用定义里的设定图做参考，只用文字")
     sub.add_parser("assist", help="参数助手：交互菜单熟悉各项参数")
     i = sub.add_parser("init", help="在目录里生成分镜模板")
     i.add_argument("project_dir")
@@ -767,9 +973,13 @@ def main():
         return
 
     if a.cmd == "keyframes":
-        gen_keyframes(a.storyboard, a.only, a.model, a.quantize, a.seeds, a.force)
+        gen_keyframes(a.storyboard, a.only, a.model, a.quantize, a.seeds, a.force, a.use_refs)
         return
     cfg = load_cfg()
+    if getattr(a, "backend", None):
+        cfg["backend"] = a.backend
+    if cfg["backend"] == "api" and a.cmd in ("gen", "board") and not getattr(a, "dry_run", False):
+        print("注意：api 后端按生成的视频秒数计费（百炼 Wan），失败不计费；价格以百炼控制台为准")
     if a.cmd == "assist":
         Assist(cfg).loop()
         return
@@ -777,31 +987,46 @@ def main():
         edit_job(cfg, a, a.cmd)
         return
     if a.cmd == "gen":
-        job = {k: v for k, v in vars(a).items() if v is not None and k not in ("cmd", "dry_run")}
+        job = {k: v for k, v in vars(a).items() if v is not None and k not in ("cmd", "dry_run", "backend")}
         run_job(cfg, job, OUT_DIR, dry=a.dry_run)
         return
 
     base, jobs = load_board(a.storyboard)
     picked = []
-    for job in jobs:
+    for i, job in enumerate(jobs):
         sid = job["id"]
         if a.only and sid not in a.only:
+            if job.get("start_from") == "prev" and a.concat:
+                job["image"] = os.path.join(base, sid, f"from_{jobs[i - 1]['id']}.png")  # 拼接时只需路径规则一致
             picked.append((sid, job))
             continue
         print(f"\n== {sid}")
-        run_job(cfg, job, os.path.join(base, sid), name_prefix=f"{sid}_", dry=a.dry_run)
+        link_shots(base, jobs, i)
+        if job.get("mode") == "still":
+            if not a.dry_run:
+                render_still_shot(base, job)
+        else:
+            run_job(cfg, job, os.path.join(base, sid), name_prefix=f"{sid}_", dry=a.dry_run)
         picked.append((sid, job))
     if a.concat and not a.dry_run:
+        with open(a.storyboard, encoding="utf-8") as f:
+            edit = json.load(f).get("settings", {}).get("edit")
         clips = []
         for sid, job in picked:
-            seed = job.get("pick", (job.get("seeds") or DEFAULTS["seeds"])[0])
-            w, h = parse_size(job)
-            tag = "_i2v" if job.get("image") else ""
-            clip = os.path.join(base, sid, f"{sid}_s{seed}_{frames_for(job)}f_{w}x{h}{tag}.mp4")
+            clip = picked_clip(base, job)
+            if job.get("mode") == "still" and not os.path.exists(clip):
+                render_still_shot(base, job)
             if not os.path.exists(clip):
-                raise SystemExit(f"{sid} 缺少种子 {seed} 的视频：{clip}")
+                raise SystemExit(f"{sid} 缺少选用种子的视频：{clip}")
             clips.append(clip)
-        concat(clips, os.path.join(base, "final.mp4"))
+        out = os.path.join(base, a.output or "final.mp4")
+        with open(a.storyboard, encoding="utf-8") as f:
+            settings = json.load(f).get("settings", {})
+        post = settings.get("audio") or any(job.get("line") or job.get("sfx") for _, job in picked)
+        if edit or post or any(any(k in job for k in EDIT_KEYS) for _, job in picked):
+            edit_concat(list(zip(clips, [job for _, job in picked])), out, edit or {}, settings, base)
+        else:
+            concat(clips, out)
 
 
 if __name__ == "__main__":
