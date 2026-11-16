@@ -15,7 +15,7 @@ LongCat 的官方示例针对 CUDA，并用 `enable_model_cpu_offload()` 节省�
 | `postprod.py` | 漫剧镜头、配音、字幕、音效、背景声与混音 | 实测过 |
 | `prompttools.py` | 提示词清理与批量导入解析 | 实测过 |
 | `video_api.py` | 商用视频 API（阿里云百炼 Wan） | 模拟接口测过，未用真实密钥 |
-| `backends.py` | 模型后端：longcat（PyTorch）、z-image-turbo、flux2-klein-4b（mflux/MLX） | 三个都实测过 |
+| `backends.py`、`models.json` | 生图模型后端：通用引擎（mflux / diffusers / longcat）+ 模型清单配置 | 三个内置模型实测过 |
 | `video.py`、`video.json` | 本地视频生成（LTX-2.3）：单镜头和分镜批量，图生视频、运镜预设、拼接成片 | 实测过（video 分支） |
 | `deploy/setup_cuda.sh`、`video_cuda.py` | Linux + NVIDIA 一键部署与 CUDA 视频运行器 | 未在真实 GPU 上测试 |
 | `ai.py`、`ai.json` | AI 提示词工具：调用 OpenAI 兼容接口扩写、翻译、看图反推等，可自定义 | 用模拟接口测过，真实接口未测 |
@@ -35,6 +35,48 @@ LongCat 的官方示例针对 CUDA，并用 `enable_model_cpu_offload()` 节省�
 - **24GB 的 Mac（如 M4 Mac mini）**：优先用两个 MLX 模型。Z-Image 精修时峰值 19GB 偏紧，可以加 `--quantize 4` 降低内存（未实测画质）。
 - 蒸馏模型（FLUX.2 klein、Z-Image-Turbo）**不支持 CFG 和负面提示词**，`/cfg`、`/neg` 会提示不生效。
 - 两个蒸馏模型本身就是满步数出图，`/refine` 能保留结构，但细节提升不明显。
+
+## 自己配置模型（models.json）
+
+生图模型不写死在代码里，清单在 `models.json`。自己加的模型写进 `models.local.json`（不进仓库，同名模型按字段覆盖），下载好模型、加一段配置就能用：
+
+```json
+{
+  "qwen-image": {
+    "engine": "diffusers", "pipeline": "QwenImagePipeline", "path": "./models/qwen-image",
+    "title": "Qwen-Image", "steps": 30, "cfg": 4.0, "supports_neg": true, "size": "1024x1024"
+  }
+}
+```
+
+```bash
+.venv/bin/python studio.py --model qwen-image
+```
+
+| 字段 | 含义 |
+|---|---|
+| `engine` | `mflux`（Mac 上的 MLX）、`diffusers`（PyTorch：NVIDIA，也能在 Mac 的 MPS 上跑）、`longcat`（LongCat 专用） |
+| `path` | 模型目录（相对仓库根目录） |
+| `title` / `env` | 显示名 / 需要用哪个虚拟环境运行（缺依赖时提示） |
+| `steps` / `preview_steps` / `size` | 正式步数、预览步数、默认尺寸 |
+| `cfg` | 默认 CFG；不写表示不支持（蒸馏模型） |
+| `supports_neg` | 是否支持负面提示词（`avoid`、`/neg` 只在支持的模型里生效） |
+| `guidance` | 不支持 CFG 的模型固定传的 guidance（如 FLUX.2 klein 是 1.0） |
+| mflux：`module` / `class` / `model_config` / `quantize` | mflux 里的模型类，如 `mflux.models.z_image` + `ZImageTurbo` |
+| mflux：`refs_class` | 支持参考图生成的类（如 `Flux2KleinEdit`），配置后 `keyframes` 可以用设定图做参考 |
+| diffusers：`pipeline` / `img2img_pipeline` | diffusers 管线名；配置图生图管线后支持 `/refine` |
+| `darwin` / `linux` | 只在 Mac / Linux 上生效的字段，例如 Mac 用 mflux、Linux 用 diffusers |
+| `download` | 下载命令（找不到模型目录时提示） |
+| `enabled` | `false` 时隐藏 |
+
+例：在 Mac 上把 Z-Image 换成 4-bit 快速版，只需在 `models.local.json` 里写：
+
+```json
+{"z-image-turbo": {"darwin": {"engine": "mflux", "module": "mflux.models.z_image", "class": "ZImageTurbo",
+                              "quantize": 4, "steps": 7, "env": ".venv-mlx"}}}
+```
+
+mflux 支持哪些模型见它的文档（`.venv-mlx/bin/mflux-generate-*` 列出的命令）；diffusers 支持的管线可以用 `python -c "import diffusers; print([n for n in dir(diffusers) if n.endswith('Pipeline')])"` 查看。
 
 ## 硬件要求
 

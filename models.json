@@ -1,0 +1,41 @@
+{
+  "_说明": "生图模型清单。自己加的模型写进 models.local.json（不进仓库，同名覆盖）。字段见 README“自己配置模型”。",
+
+  "longcat": {
+    "engine": "longcat",
+    "title": "LongCat-Image（6B）",
+    "path": "./model-t2i",
+    "env": ".venv",
+    "size": "768x768",
+    "steps": 25,
+    "preview_steps": 8,
+    "cfg": 4.0,
+    "supports_neg": true,
+    "out_dir": "./outputs",
+    "download": "modelscope download --model meituan-longcat/LongCat-Image --local-dir ./model-t2i"
+  },
+
+  "z-image-turbo": {
+    "title": "Z-Image-Turbo（6B）",
+    "path": "./models/z-image-turbo",
+    "size": "1024x1024",
+    "download": "modelscope download --model Tongyi-MAI/Z-Image-Turbo --local-dir ./models/z-image-turbo",
+    "darwin": {"engine": "mflux", "module": "mflux.models.z_image", "class": "ZImageTurbo",
+               "quantize": 8, "steps": 9, "env": ".venv-mlx", "title": "Z-Image-Turbo（6B，MLX）"},
+    "linux": {"engine": "diffusers", "pipeline": "ZImagePipeline", "img2img_pipeline": "ZImageImg2ImgPipeline",
+              "steps": 8, "guidance": 0.0, "env": ".venv-cuda", "title": "Z-Image-Turbo（6B，CUDA）"}
+  },
+
+  "flux2-klein-4b": {
+    "title": "FLUX.2 klein 4B",
+    "path": "./models/flux2-klein-4b",
+    "size": "1024x1024",
+    "steps": 4,
+    "download": "modelscope download --model black-forest-labs/FLUX.2-klein-4B --local-dir ./models/flux2-klein-4b --exclude flux-2-klein-4b.safetensors",
+    "darwin": {"engine": "mflux", "module": "mflux.models.flux2.variants", "class": "Flux2Klein",
+               "model_config": "flux2_klein_4b", "refs_class": "Flux2KleinEdit",
+               "quantize": 8, "env": ".venv-mlx", "title": "FLUX.2 klein 4B（MLX）"},
+    "linux": {"engine": "diffusers", "pipeline": "Flux2KleinPipeline", "guidance": 1.0,
+              "env": ".venv-cuda", "title": "FLUX.2 klein 4B（CUDA）"}
+  }
+}
