@@ -6,6 +6,7 @@
   .venv-mlx/bin/python assets.py new 红带武士 --kind character --desc "一名年轻武士，……" --style 游戏CG
   .venv-mlx/bin/python assets.py sheet 红带武士             # 按定义生成设定图（三视图等）
   .venv-mlx/bin/python assets.py sheet 红带武士 --only front --seed 43   # 只重出某一张
+  .venv-mlx/bin/python assets.py import 八岐大蛇 ~/Downloads/大蛇.png --as full   # 导入网页版等外部生成的图
   .venv-mlx/bin/python assets.py list
   .venv-mlx/bin/python assets.py show 红带武士
 
@@ -172,6 +173,31 @@ def cmd_sheet(a):
         json.dump(raw, f, ensure_ascii=False, indent=2)
 
 
+def cmd_import(a):
+    """把外部生成的图片（网页版、其他工具、手绘）导入为设定图，并登记到定义里。"""
+    import shutil
+    data, d = load(a.name)
+    if not os.path.exists(a.file):
+        raise SystemExit(f"找不到图片：{a.file}")
+    key = a.as_name or os.path.splitext(os.path.basename(a.file))[0]
+    dst = os.path.join(d, f"{key}.png")
+    if os.path.exists(dst):  # 旧图留一个备份，方便回退
+        shutil.copyfile(dst, os.path.join(d, f"{key}_before_import_{time.strftime('%m%d%H%M%S')}.png"))
+    from PIL import Image
+    Image.open(a.file).convert("RGB").save(dst)
+    path = os.path.join(d, "definition.json")
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    images = [x for x in (raw.get("images") or []) if x != f"{key}.png"]
+    raw["images"] = [f"{key}.png"] + images if a.first else images + [f"{key}.png"]
+    raw.setdefault("_来源", {})[f"{key}.png"] = f"外部导入：{os.path.abspath(a.file)}（{time.strftime('%Y-%m-%d %H:%M')}）"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    order = "、".join(raw["images"])
+    print(f"已导入 -> {os.path.relpath(dst, HERE)}；当前设定图顺序：{order}")
+    print("出关键帧时按这个顺序取参考图（每个定义取 ref_images 张）；--first 可以把导入的图排到最前")
+
+
 def cmd_list(_):
     items = all_assets()
     if not items:
@@ -213,11 +239,16 @@ def main():
     s.add_argument("--seed", type=int, help="覆盖定义里的种子")
     s.add_argument("--model", default="z-image-turbo")
     s.add_argument("--quantize", type=int)
+    im = sub.add_parser("import", help="导入外部生成的图片作为设定图")
+    im.add_argument("name")
+    im.add_argument("file")
+    im.add_argument("--as", dest="as_name", help="保存成哪个名字（如 full、front），默认用原文件名")
+    im.add_argument("--first", action="store_true", help="排到设定图最前面，出关键帧时优先作为参考")
     sub.add_parser("list", help="列出所有定义")
     sh = sub.add_parser("show", help="查看一个定义")
     sh.add_argument("name")
     a = ap.parse_args()
-    {"new": cmd_new, "sheet": cmd_sheet, "list": cmd_list, "show": cmd_show}[a.cmd](a)
+    {"new": cmd_new, "sheet": cmd_sheet, "import": cmd_import, "list": cmd_list, "show": cmd_show}[a.cmd](a)
 
 
 if __name__ == "__main__":
