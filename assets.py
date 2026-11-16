@@ -162,7 +162,7 @@ def cmd_sheet(a):
         img, _ = backend.generate(prompt, neg, w, h, backend.final_steps, seed, backend.cfg)
         fname = f"{key}.png"
         img.save(os.path.join(d, fname))
-        img.save(os.path.join(d, f"{key}_s{seed}.png"))  # 保留每个种子的版本，方便回退
+        img.save(os.path.join(d, f"{key}_{a.model}_s{seed}.png"))  # 按模型+种子保留每个版本，方便回退和对比
         backend.cleanup()
         made.append(fname)
         print(f"  -> {os.path.relpath(os.path.join(d, fname), HERE)}  ({time.time() - t0:.0f}s)", flush=True)
