@@ -9,6 +9,7 @@
   .venv-mlx/bin/python video.py gen "..." --image a.png --end-image b.png   # 锁定首尾帧
 
 分镜（批量）：
+  .venv-mlx/bin/python video.py keyframes projects/猫咖啡店/storyboard.json        # 按 keyframe 描述批量出关键帧
   .venv-mlx/bin/python video.py board projects/猫咖啡店/storyboard.json            # 生成全部镜头
   .venv-mlx/bin/python video.py board projects/猫咖啡店/storyboard.json --only S03  # 只重做 S03
   .venv-mlx/bin/python video.py board projects/猫咖啡店/storyboard.json --concat    # 拼接成片
@@ -320,6 +321,18 @@ TEMPLATE = {
 }
 
 
+REF_KEYS = ("character", "scene", "refs")
+
+
+def fill_refs(text, settings):
+    """把 {character}、{scene} 以及 settings.refs 里的 {名字} 替换成设定描述。"""
+    refs = {k: settings[k] for k in ("character", "scene") if isinstance(settings.get(k), str)}
+    refs.update(settings.get("refs") or {})
+    for k, v in refs.items():
+        text = text.replace("{" + k + "}", v)
+    return text
+
+
 def load_board(path):
     with open(path, encoding="utf-8") as f:
         board = json.load(f)
@@ -327,15 +340,56 @@ def load_board(path):
     settings = {k: v for k, v in board.get("settings", {}).items() if not k.startswith("_")}
     jobs = []
     for shot in board["shots"]:
-        job = {k: v for k, v in settings.items() if k not in ("character", "scene")}
+        job = {k: v for k, v in settings.items() if k not in REF_KEYS}
         job.update({k: v for k, v in shot.items() if not k.startswith("_")})
-        job["prompt"] = job["prompt"].replace("{character}", settings.get("character", "")) \
-                                     .replace("{scene}", settings.get("scene", ""))
+        job["prompt"] = fill_refs(job["prompt"], settings)
+        if job.get("keyframe"):
+            job["keyframe"] = fill_refs(job["keyframe"], settings)
         for key in ("image", "end_image"):
             if job.get(key) and not os.path.isabs(job[key]):
                 job[key] = os.path.join(base, job[key])
         jobs.append(job)
     return base, jobs
+
+
+def gen_keyframes(path, only=None, model=None, quantize=None, seeds=None, force=False):
+    """按分镜里每个镜头的 keyframe（静态画面描述）批量出关键帧，写回 image 字段。"""
+    base, jobs = load_board(path)
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    settings = raw.get("settings", {})
+    model = model or settings.get("keyframe_model", "z-image-turbo")
+    todo = [j for j in jobs if j.get("keyframe") and (not only or j["id"] in only)]
+    todo = [j for j in todo if force or only or not os.path.exists(os.path.join(base, f"{j['id']}.png"))]
+    if not todo:
+        print("没有需要生成的关键帧（已存在的会跳过；--only 指定镜头或加 --force 重新生成）")
+        return
+    sys.path.insert(0, HERE)
+    from backends import BACKENDS
+    print(f"加载 {BACKENDS[model].title} ...")
+    backend = BACKENDS[model](quantize=quantize)
+    for job in todo:
+        w, h = parse_size(job)
+        kw, kh = map(int, str(job.get("keyframe_size") or f"{w * 3 // 2}x{h * 3 // 2}").split("x"))
+        prompt = compose(dict(job, prompt=job["keyframe"], camera=None, motion=None, ai=None))
+        shot_seeds = seeds or job.get("keyframe_seeds") or [job.get("keyframe_seed", 42)]
+        print(f"\n== {job['id']}  {kw}x{kh}  种子 {shot_seeds}\n  {prompt}")
+        for seed in shot_seeds:
+            t0 = time.time()
+            img, _ = backend.generate(prompt, "", kw, kh, backend.final_steps, seed, backend.cfg)
+            out = os.path.join(base, f"{job['id']}_kf_s{seed}.png")
+            img.save(out)
+            backend.cleanup()
+            print(f"  -> {os.path.relpath(out, HERE)}  ({time.time() - t0:.0f}s)")
+        # 第一个种子作为当前关键帧；想换就把 image 改成其他 _kf_sN.png
+        chosen = f"{job['id']}_kf_s{shot_seeds[0]}.png"
+        shutil.copyfile(os.path.join(base, chosen), os.path.join(base, f"{job['id']}.png"))
+        for shot in raw["shots"]:
+            if shot.get("id") == job["id"]:
+                shot["image"] = f"{job['id']}.png"
+                shot["_keyframe_from"] = chosen
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2)
 
 
 def concat(clips, out):
@@ -655,6 +709,13 @@ def main():
     add_edit_args(e)
     e.add_argument("--seconds", type=float, help="续写秒数（默认 2）")
     e.add_argument("--image", help="续写结尾要到达的画面")
+    k = sub.add_parser("keyframes", help="按分镜批量生成关键帧（用生图模型，需在 .venv-mlx 里运行）")
+    k.add_argument("storyboard")
+    k.add_argument("--only", nargs="+", help="只生成这些镜头")
+    k.add_argument("--model", help="生图模型（默认 settings.keyframe_model 或 z-image-turbo）")
+    k.add_argument("--quantize", type=int)
+    k.add_argument("--seed", dest="seeds", type=int, nargs="+", help="覆盖种子；多个种子都会出图，第一个作为当前关键帧")
+    k.add_argument("--force", action="store_true", help="已有关键帧也重新生成")
     sub.add_parser("assist", help="参数助手：交互菜单熟悉各项参数")
     i = sub.add_parser("init", help="在目录里生成分镜模板")
     i.add_argument("project_dir")
@@ -670,6 +731,9 @@ def main():
         print(f"分镜模板 -> {path}")
         return
 
+    if a.cmd == "keyframes":
+        gen_keyframes(a.storyboard, a.only, a.model, a.quantize, a.seeds, a.force)
+        return
     cfg = load_cfg()
     if a.cmd == "assist":
         Assist(cfg).loop()
