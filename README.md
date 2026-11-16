@@ -11,6 +11,7 @@ LongCat 的官方示例针对 CUDA，并用 `enable_model_cpu_offload()` 节省�
 | `edit.py` | LongCat-Image-Edit-Turbo 改图（照片 + 指令） | 未实测 |
 | `presets.py` | `studio.py` 用的提示词预设，可以自己加 | — |
 | `backends.py` | 模型后端：longcat（PyTorch）、z-image-turbo、flux2-klein-4b（mflux/MLX） | 三个都实测过 |
+| `video.py`、`video.json` | 本地视频生成（LTX-2.3）：单镜头和分镜批量，图生视频、运镜预设、拼接成片 | 实测过（video 分支） |
 | `ai.py`、`ai.json` | AI 提示词工具：调用 OpenAI 兼容接口扩写、翻译、看图反推等，可自定义 | 用模拟接口测过，真实接口未测 |
 
 ## 模型选择（M1 Pro 32GB 实测）
@@ -270,6 +271,81 @@ LongCat 官方 API 目前只提供 LongCat-2.5（对话和看图），没有图�
 ```
 
 Edit-Turbo 是蒸馏模型，默认 8 步，不使用 CFG。
+
+## 视频生成（video.py，实验中）
+
+用 LTX-2.3 蒸馏版（MLX 4-bit）在本地生成短视频。和 `studio.py` 共用预设和 AI 提示词工具，但**单独运行**：视频模型约占 15GB 内存，不和生图模型同时加载。推荐流程是先用 studio 出关键帧，退出后再用 `video.py` 让它动起来。
+
+### 安装
+
+LTX 装在单独的目录和虚拟环境里（依赖和生图环境不兼容），路径写在 `video.json`；本机路径不同时，新建 `video.local.json` 覆盖（不进仓库）。
+
+```bash
+mkdir -p video-lab && cd video-lab
+git clone https://github.com/dgrauet/ltx-2-mlx
+git -C ltx-2-mlx checkout 895201df379b079c2154738bcf92005b7a371923   # 24GB 实测用的版本
+python3 -m venv ltx-mlx
+ltx-mlx/bin/pip install -e ltx-2-mlx/packages/ltx-core-mlx -e ltx-2-mlx/packages/ltx-pipelines-mlx av imageio-ffmpeg psutil
+# 模型约 20GB（HF），文本编码器 Gemma 约 8GB（魔搭）
+hf download dgrauet/ltx-2.3-mlx-q4 --include "*.json" "connector.safetensors" \
+  "transformer-distilled-1.1.safetensors" "spatial_upscaler_x2_v1_1.safetensors" \
+  "vae_decoder.safetensors" "vae_encoder.safetensors" --local-dir ltx-model
+modelscope download --model mlx-community/gemma-3-12b-it-4bit --local-dir gemma
+```
+
+拼接成片需要 ffmpeg：`brew install ffmpeg`。
+
+### 单个镜头
+
+```bash
+.venv-mlx/bin/python video.py gen "橘猫慢慢眨眼，尾巴轻轻摆动" --image cat.png --camera 推进 --motion 轻微
+.venv-mlx/bin/python video.py gen "..." --seed 42 43 44            # 一次出多个种子挑选
+.venv-mlx/bin/python video.py gen "..." --image a.png --end-image b.png   # 锁定首尾帧
+.venv-mlx/bin/python video.py gen "..." --dry-run                  # 只打印命令
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--image` / `--end-image` | 首帧 / 尾帧关键帧（图生视频），会自动居中裁成视频比例 |
+| `--image-strength` | 首帧锁定强度 0–1，默认 1.0 |
+| `--seed 42 43 …` | 一个或多个种子 |
+| `--seconds` / `--frames` / `--fps` | 时长（默认 2 秒、25fps）；帧数自动调整为 LTX 要求的 8n+1 |
+| `--ratio` / `--size` | 画幅：横屏 768×512（默认）、宽屏 896×512、竖屏 512×768、方形 640×640、高清横屏 1152×768、小横屏 512×320；自定义尺寸须为 64 的倍数 |
+| `--camera` | 运镜：固定、推进、拉远、左移、右移、上摇、环绕、跟拍、手持 |
+| `--motion` | 动作幅度：轻微、自然、明显 |
+| `--style` `--shot` `--light` `--tone` `--time` `--detail` | 和 studio 相同的提示词预设 |
+| `--neg` | 负面提示词（预设名或文本，通过 NAG 生效） |
+| `--ai 扩写` / `--ai 英译` | 生成前用 AI 工具处理提示词 |
+| `--enhance` | 用 LTX 自带的 Gemma 扩写提示词 |
+| `--audio` | 同时生成音频（默认关闭） |
+| `--no-low-ram` | 关闭低内存模式（内存充足时更快） |
+
+输出在 `outputs/video/`，每个视频旁边有同名 `.json`（完整参数）和 `.log`。参数完全相同的视频会直接跳过，不重复生成。
+
+### 分镜（批量）
+
+```bash
+.venv-mlx/bin/python video.py init projects/猫咖啡店                          # 生成分镜模板
+.venv-mlx/bin/python video.py board projects/猫咖啡店/storyboard.json          # 生成全部镜头
+.venv-mlx/bin/python video.py board projects/猫咖啡店/storyboard.json --only S03  # 只重做 S03
+.venv-mlx/bin/python video.py board projects/猫咖啡店/storyboard.json --concat    # 拼接成片 final.mp4
+```
+
+`storyboard.json` 由全片设置 `settings` 和镜头列表 `shots` 组成：镜头里的字段会覆盖全片设置；`{character}`、`{scene}` 会替换成设定里的角色和场景描述（保证每个镜头的描述一字不差）；`image` 是关键帧路径（相对分镜文件）；`pick` 指定拼接时用哪个种子。每个镜头输出到 `projects/<片名>/<镜号>/`。改了某个镜头只需要重跑它，没改的镜头会自动跳过。
+
+### 实测（M1 Pro 32GB）
+
+| 场景 | 耗时 | 内存峰值 |
+|---|---|---|
+| 768×512，49 帧（约 2 秒），文生视频 | 约 194 秒 | 约 15.5GB |
+| 768×512，49 帧，图生视频（Z-Image 关键帧） | 约 197 秒 | 约 15.5GB |
+| 512×320，49 帧，分镜里的单个镜头 | 约 110 秒 | — |
+
+- 中文提示词能正确理解（橘猫、窗台、看窗外）。
+- **图生视频的一致性很好**：首帧和关键帧完全一致，猫的花纹、窗户全程不变。文生视频的 2 秒内动作幅度很小。
+- 资料显示 LTX-2.3 超过约 2 秒（97 帧以上）成功率明显下降，所以建议每个镜头 2 秒左右，靠分镜拼接成长视频。
+- 24GB M4 Pro 上的公开实测：768×512、49 帧约 110–130 秒，峰值 14.6GB。基础版 M4 没有实测数据。
+- 许可：LTX-2 社区许可，年收入 1000 万美元以下可免费商用。
 
 ## 实测速度（M1 Pro 32GB）
 

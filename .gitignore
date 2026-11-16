@@ -9,3 +9,5 @@ __pycache__/
 ai.local.json
 .venv-mlx/
 models/
+video.local.json
+projects/
