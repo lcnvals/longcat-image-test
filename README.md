@@ -365,38 +365,62 @@ video> /gen                  ← 按当前参数生成
 
 `storyboard.json` 由全片设置 `settings` 和镜头列表 `shots` 组成：镜头里的字段会覆盖全片设置；`{character}`、`{scene}` 会替换成设定里的角色和场景描述（保证每个镜头的描述一字不差）；`image` 是关键帧路径（相对分镜文件）；`pick` 指定拼接时用哪个种子。每个镜头输出到 `projects/<片名>/<镜号>/`。改了某个镜头只需要重跑它，没改的镜头会自动跳过。
 
-### 定义：角色、怪物、场景（assets.py）
+### 定义：人物、装备服饰、技能、场景（assets.py）
 
-角色、怪物、场景定义一次，所有镜头和项目都引用。每个定义 = 外观描述 + 设定图 + 音色：
+参考换装类游戏和网游的设计，把“人物长什么样、穿什么、会什么技能、在什么地方”拆成可复用的定义。定一次，所有镜头和项目都引用。
 
-```bash
-.venv-mlx/bin/python assets.py new 红带武士 --kind character --style 游戏CG \
-  --desc "一名年轻武士，黑色短发，额头系着红色发带，身穿白色内衬和深蓝色轻甲，手持一把长太刀" \
-  --must 红色发带 深蓝色轻甲 --voice Tingting
-.venv-mlx/bin/python assets.py sheet 红带武士      # 按定义生成设定图：角色是正面/侧面/背面/战斗姿态
-.venv-mlx/bin/python assets.py list                 # 列出所有定义
-.venv-mlx/bin/python assets.py show 红带武士        # 查看描述、必须特征、音色、设定图
-```
+| 类别 | `--kind` | 说明 |
+|---|---|---|
+| 人物 / 怪物 | `character` / `monster` | **本体**（脸、体型、发色，不含服装）+ **栏位** + **套装** + 技能 + 音色 |
+| 武器 / 护甲 / 服饰 / 饰品 / 道具 | `weapon` / `armor` / `outfit` / `accessory` / `prop` | 单品，各有设定图，记录默认穿在哪个栏位，可以给不同人物用 |
+| 坐骑 | `mount` | 坐骑栏位 |
+| 技能 | `skill` | 人物和怪物都可以有：**前摇 / 释放 / 命中**三段 + 固定色调 + 音效 + 剪辑方式 |
+| 世界观 / 区域 / 地点 | `world` / `region` / `scene` | 地点向上继承区域和世界观的描述；地点有**时间、天气变体** |
 
-定义存在 `assets/<类别>/<名字>/definition.json`（类别：characters、monsters、scenes、props）：
-
-| 字段 | 作用 |
-|---|---|
-| `desc` | 外观描述，每个镜头原样引用 |
-| `must` | 必须保持的特征，会追加到描述后面 |
-| `avoid` | 不该出现的特征；**只在支持负面提示词的模型里生效**。在正面提示词里写“不要出现四肢”反而会画出四肢，所以不支持负面提示词的模型请在 `desc` 里用正面描述（如“蛇形身躯盘绕在地面上”） |
-| `voice` | 这个角色说台词用的音色（见下文“声音”） |
-| `display_name` | 字幕里显示的名字 |
-| `sheets` | 要生成哪些设定图、各自的画面要求和尺寸 |
-
-分镜里用 `cast` 引用，镜头描述里写 `{hero}` 等占位符：
+**栏位**（`assets.py slots` 查看）：发型、妆容、头饰、耳饰、面饰、颈饰、连衣裙（与上衣、下装互斥）、上衣、下装、护甲、外套、手饰、腰饰、袜子、鞋子、背饰、主手、副手、坐骑。要拆得更细（比如发饰、头冠分开），在 `assets/slots.json` 里加：
 
 ```json
-"settings": {"cast": {"hero": "红带武士", "monster": "八岐大蛇", "scene": "火山峡谷"}, "ref_images": 1},
-"shots": [{"id": "S04", "keyframe": "{scene}，{hero}挥刀砍在{monster}的鳞片上", "prompt": "太刀砍在鳞片上迸出火花"}]
+[{"slot": "发饰", "group": "饰品", "template": "头发上别着{}"}]
 ```
 
-`video.py keyframes` 出关键帧时，会自动把这个镜头里出场的定义的设定图作为参考（每个定义取 `ref_images` 张），用支持参考图的 FLUX.2 klein 生成，外观更一致；`--no-refs` 关闭。
+**常用命令**
+
+```bash
+A() { .venv-mlx/bin/python assets.py "$@"; }
+A new 红带武士 --kind character --base "一名年轻男性武士，黑色短发，剑眉星目，身形精瘦" --voice Tingting
+A new 断罪太刀 --kind weapon --style 游戏CG --desc "一把长太刀，刀身修长微弯，黑色刀柄缠绕红色绳结"
+A wear 红带武士 主手 断罪太刀            # 栏位填单品名字（引用定义），或直接写一段描述；- 表示脱下
+A wear 红带武士 下装 深蓝色袴裤
+A loadout 红带武士 便装 护甲=- 上衣=素色和服 主手=一把木刀   # 套装：覆盖部分栏位
+A describe 红带武士 --loadout 便装        # 预览拼出来的完整描述
+A sheet 红带武士                          # 生成设定图；--loadout 便装 生成套装的设定图
+A new 烈焰吐息 --kind skill --owner 八岐大蛇   # 然后在 definition.json 里填三个阶段、color、sfx、edit
+A new 炎狱山脉 --kind region --parent 东方奇幻 --desc "连绵的火山山脉……"
+A sheet 火山峡谷 --variant 夜·暴雨        # 地点变体的设定图
+A import 八岐大蛇 ~/Downloads/大蛇.png --as full --first   # 导入外部生成的图
+A list --kind weapon / A show 红带武士
+```
+
+单品可以被多个人物穿戴；改了单品定义，所有穿着它的人物都会跟着变。
+
+**定义里的通用字段**：`must`（必须保持的特征，追加在描述后）、`avoid`（不该出现的；**只在支持负面提示词的模型里生效**，在正面提示词里写“不要出现四肢”反而会画出四肢，不支持的模型请用正面描述）、`display_name`（字幕里的名字）、`voice`（台词音色）、`sheets`（要生成哪些设定图）。
+
+**分镜里使用**
+
+```json
+"settings": {"cast": {"hero": "红带武士", "monster": "八岐大蛇",
+                      "scene": {"name": "火山峡谷", "variant": "夜·暴雨"}},
+             "ref_images": 1, "max_refs": 3},
+"shots": [
+  {"id": "S01", "keyframe": "{scene}，{hero}在茶屋中擦拭刀身", "loadout": {"hero": "便装"}, "variant": {"scene": "黄昏"}},
+  {"id": "S02", "keyframe": "{scene}，{monster}昂首", "skill": "八岐大蛇.烈焰吐息", "stage": "前摇"},
+  {"id": "S03", "keyframe": "{scene}，{monster}对着{hero}", "skill": "八岐大蛇.烈焰吐息", "stage": "释放"}
+]
+```
+
+- `{hero}` 展开成人物的完整描述（本体 + 当前穿戴）；`loadout` 换装、`variant` 切换地点变体，都只影响这个镜头。
+- `skill` + `stage` 把技能这一阶段的描述和色调加进画面和动作，并自动套用技能的音效和剪辑方式（镜头里写了的优先）。同一个技能可以拆成前摇、释放、命中几个镜头，每次出现颜色和形态都一致。
+- `video.py keyframes` 出关键帧时，把镜头里出场定义的设定图作为参考（本体在前、装备在后，每个定义取 `ref_images` 张，总数不超过 `max_refs`）。换装时优先用套装的设定图；没有就不拿默认造型的图做参考，避免被带偏。
 
 ### 从网页版或其他工具导入提示词
 

@@ -1,0 +1,29 @@
+{
+  "name": "巨尾横扫",
+  "kind": "skill",
+  "desc": "",
+  "owner": "八岐大蛇",
+  "type": "近战·范围",
+  "color": "暗红",
+  "stages": {
+    "前摇": "巨大的蛇尾向后卷起蓄力",
+    "释放": "蛇尾横扫而过，带起碎石和烟尘",
+    "命中": "蛇尾砸中岩柱，岩柱碎裂崩塌"
+  },
+  "sfx": "impact",
+  "edit": {
+    "in": "flash",
+    "shake": true
+  },
+  "must": [],
+  "avoid": [],
+  "style": null,
+  "seed": 42,
+  "images": [],
+  "sheets": {
+    "effect": {
+      "prompt": "技能特效概念图，深色背景上展示特效的形态和颜色，没有人物",
+      "size": "1152x768"
+    }
+  }
+}

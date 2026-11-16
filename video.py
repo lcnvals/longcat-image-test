@@ -431,7 +431,7 @@ TEMPLATE = {
 }
 
 
-REF_KEYS = ("character", "scene", "refs", "cast", "ref_images", "keyframe_ref_model")
+REF_KEYS = ("character", "scene", "refs", "cast", "ref_images", "max_refs", "keyframe_ref_model")
 
 
 def fill_refs(text, settings):
@@ -444,22 +444,45 @@ def fill_refs(text, settings):
 
 
 def load_board(path):
+    """读分镜，展开每个镜头：定义（cast）、换装（loadout）、场景变体（variant）、技能（skill + stage）。"""
     with open(path, encoding="utf-8") as f:
         board = json.load(f)
     base = os.path.dirname(os.path.abspath(path))
     settings = {k: v for k, v in board.get("settings", {}).items() if not k.startswith("_")}
-    cast_imgs, cast_voices = {}, {}
-    if settings.get("cast"):  # 引用 assets/ 里的定义：描述文字 + 设定图
+    own_refs = dict(settings.get("refs") or {})  # 分镜里直接写的 refs 文字，优先于定义
+    cast = settings.get("cast")
+    assets = None
+    if cast or any(s.get("skill") for s in board["shots"]):
         sys.path.insert(0, HERE)
         import assets
-        cast_texts, cast_imgs, cast_voices = assets.resolve_cast(settings["cast"], with_voice=True)
-        settings["refs"] = {**cast_texts, **(settings.get("refs") or {})}  # refs 里写的同名项优先
+    cache = {}
+
+    def cast_for(loadouts=None, variants=None):
+        """按镜头的换装/变体解析 cast，相同组合只解析一次。"""
+        key = (json.dumps(loadouts or {}, sort_keys=True), json.dumps(variants or {}, sort_keys=True))
+        if key not in cache:
+            cache[key] = assets.resolve_cast(cast, True, loadouts, variants) if cast else ({}, {}, {})
+        return cache[key]
+
     per_asset = int(settings.get("ref_images", 1))
+    max_refs = int(settings.get("max_refs", 3))  # 参考图太多会更慢、更占内存
     jobs = []
     for shot in board["shots"]:
+        texts, cast_imgs, cast_voices = cast_for(shot.get("loadout"), shot.get("variant"))
+        shot_settings = dict(settings, refs={**texts, **own_refs})
         job = {k: v for k, v in settings.items() if k not in REF_KEYS}
         job.update({k: v for k, v in shot.items() if not k.startswith("_")})
-        job["prompt"] = fill_refs(job.get("prompt", ""), settings)  # 漫剧镜头可以不写
+        job["prompt"] = fill_refs(job.get("prompt", ""), shot_settings)  # 漫剧镜头可以不写
+        if job.get("skill"):  # 技能：这一阶段的描述加进画面和动作，并带上技能的音效和剪辑方式
+            sk = assets.find_skill(job["skill"])
+            stxt = assets.skill_text(sk, job.get("stage"))
+            job["prompt"] = "，".join(x for x in (job["prompt"], stxt) if x)
+            if job.get("keyframe"):
+                job["keyframe"] = job["keyframe"] + "，" + stxt
+            for k, v in (sk.get("edit") or {}).items():
+                job.setdefault(k, v) if k not in shot else None
+            if sk.get("sfx") and "sfx" not in shot:
+                job["sfx"] = sk["sfx"]
         if job.get("speaker"):  # 台词跟随角色：用角色定义里的音色，字幕可带上角色名
             sp = cast_voices.get(job["speaker"])
             if sp is None:
@@ -469,12 +492,12 @@ def load_board(path):
                 job["_voice_cfg"] = sp["voice"]
         if job.get("keyframe"):
             raw_kf = job["keyframe"]
-            # 这个镜头出现了哪些定义（按在描述里出现的顺序），各取前 per_asset 张设定图作为参考
+            # 这个镜头出现了哪些定义（按在描述里出现的顺序），各取前 n 张参考图（本体在前、装备在后），总数不超过 max_refs
             used = sorted((k for k in cast_imgs if "{" + k + "}" in raw_kf), key=lambda k: raw_kf.index("{" + k + "}"))
             job["_cast"] = used
-            n = int(shot.get("ref_images", per_asset))  # 镜头里可以单独指定每个定义用几张设定图
-            job["_refs"] = [img for k in used for img in cast_imgs[k][:n]]
-            job["keyframe"] = fill_refs(raw_kf, settings)
+            n = int(shot.get("ref_images", per_asset))
+            job["_refs"] = [img for k in used for img in cast_imgs[k][:n]][:int(shot.get("max_refs", max_refs))]
+            job["keyframe"] = fill_refs(raw_kf, shot_settings)
         for key in ("image", "end_image"):
             if job.get(key) and not os.path.isabs(job[key]):
                 job[key] = os.path.join(base, job[key])

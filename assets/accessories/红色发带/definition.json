@@ -1,0 +1,17 @@
+{
+  "name": "红色发带",
+  "kind": "accessory",
+  "desc": "一条红色长发带，系在额头，两端随风飘动",
+  "slot": "头饰",
+  "must": [],
+  "avoid": [],
+  "style": "游戏CG",
+  "seed": 42,
+  "images": [],
+  "sheets": {
+    "front": {
+      "prompt": "饰品设定图，正面特写完整展示，纯浅灰色背景",
+      "size": "1024x1024"
+    }
+  }
+}
