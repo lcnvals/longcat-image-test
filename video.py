@@ -480,9 +480,13 @@ def load_board(path):
             job["prompt"] = "，".join(x for x in (job["prompt"], stxt) if x)
             if job.get("keyframe"):
                 job["keyframe"] = job["keyframe"] + "，" + stxt
+            stage = job.get("stage") or "释放"
             for k, v in (sk.get("edit") or {}).items():
-                job.setdefault(k, v) if k not in shot else None
-            if sk.get("sfx") and "sfx" not in shot:
+                # 剪辑方式按阶段生效：闪白只在命中瞬间，震屏在释放和命中；前摇是蓄力，保持安静
+                if (k == "in" and stage != "命中") or (k == "shake" and stage == "前摇"):
+                    continue
+                job.setdefault(k, v)
+            if sk.get("sfx") and "sfx" not in shot and stage != "前摇":
                 job["sfx"] = sk["sfx"]
         if job.get("speaker"):  # 台词跟随角色：用角色定义里的音色，字幕可带上角色名
             sp = cast_voices.get(job["speaker"])
@@ -626,6 +630,12 @@ def edit_concat(items, out, edit, settings=None, base=None):
         length = (b - a) / speed
         vf = [f"trim=start={a}:end={b}", f"setpts=(PTS-STARTPTS)/{speed}", f"fps={fps}",
               f"scale={tw}:{th}:force_original_aspect_ratio=increase", f"crop={tw}:{th}", "setsar=1"]
+        if job.get("shake") and job.get("mode") != "still":
+            # 震屏：命中/释放的瞬间（镜头开头 0.4 秒）画面抖动，漫剧镜头在渲染时已经处理
+            amp = 10
+            vf += [f"crop={tw - 2 * amp}:{th - 2 * amp}:"
+                   f"x='{amp}+if(lt(t,0.4),{amp}*sin(t*90),0)':y='{amp}+if(lt(t,0.4),{amp}*cos(t*110),0)'",
+                   f"scale={tw}:{th}"]
         if job.get("line") and job.get("mode") != "still":
             # 台词比画面长：最后一帧定格到念完，避免台词被下一镜或片尾截断
             import postprod

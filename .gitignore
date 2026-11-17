@@ -13,3 +13,6 @@ video.local.json
 projects/
 .venv-cuda/
 assets/**/*.png
+models.local.json
+models
+model-t2i

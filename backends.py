@@ -1,13 +1,13 @@
-"""studio.py 的模型后端。每个后端把一个模型包装成统一的 generate() 接口。
+"""生图模型后端：把每个模型包装成统一的 generate() 接口。
 
-运行环境（依赖互不兼容，分开装）：
-  Mac：
-    longcat                        -> .venv      （PyTorch + diffusers，MPS）
-    z-image-turbo / flux2-klein-4b -> .venv-mlx  （mflux，Apple MLX 原生，更省内存、更快）
-  Linux + NVIDIA（deploy/setup_cuda.sh 一键安装）：
-    三个模型都用 .venv-cuda（PyTorch + diffusers，CUDA）；同名 --model，自动选用 CUDA 实现
+模型清单在 models.json（随仓库）和 models.local.json（你自己加的，不进仓库）里配置，不用改代码：
+  engine 选通用引擎：
+    mflux     Apple MLX（Mac），按 module + class 加载 mflux 里的模型
+    diffusers PyTorch（NVIDIA CUDA，也能在 Mac 的 MPS 上跑），按 pipeline 名加载 diffusers 管线
+    longcat   LongCat-Image 专用实现（文本编码器量化、提示词缓存、精修）
+  同一个模型可以在 "darwin" / "linux" 里给 Mac 和 Linux 分别配置（例如 Mac 用 mflux、Linux 用 diffusers）。
 
-依赖都在各后端内部导入，所以 studio.py 在两个环境里都能运行。
+依赖都在引擎内部导入，所以 studio.py 在各个虚拟环境里都能运行。
 """
 import gc
 import os
@@ -60,9 +60,10 @@ class LongCatBackend(Backend):
     preview_steps, final_steps, default_size = 8, 25, "768x768"
     cfg, supports_neg = 4.0, True
     out_dir = "./outputs"    # 沿用原有目录，保留历史记录
-    MODEL = "./model-t2i"
+    spec = {}
 
     def __init__(self, quant_transformer=False, **_):
+        self.MODEL = resolve_path(self.spec.get("path", "./model-t2i"))
         import torch
         from diffusers import LongCatImagePipeline
         from diffusers.pipelines.longcat_image.pipeline_longcat_image import prepare_pos_ids
@@ -160,35 +161,55 @@ class LongCatBackend(Backend):
 
 
 class MfluxBackend(Backend):
-    """mflux（Apple MLX）模型。蒸馏模型：不支持 CFG 和负面提示词，步数很少。"""
+    """mflux（Apple MLX）通用引擎：按配置里的 module + class 加载。蒸馏模型一般不支持 CFG 和负面提示词。"""
     env = ".venv-mlx"
-    cfg, supports_neg = None, False
-    default_size = "1024x1024"
-    quantize = 8
+    spec = {}
 
     def __init__(self, quantize=None, **_):
-        q = quantize or self.quantize
-        path = f"./models/{self.key}"
+        sp = self.spec
+        q = quantize or sp.get("quantize", 8)
+        path = resolve_path(sp.get("path", f"./models/{self.key}"))
         if not os.path.isdir(path):
-            raise SystemExit(f"找不到模型目录 {path}，先按 README 从魔搭下载")
+            raise SystemExit(f"找不到模型目录 {path}，先下载模型（见 README 或 models.json 里的 download）")
         t0 = time.time()
         self.path, self.q = path, q
-        self.model = self.load(path, q)
+        self.model = self._build(sp.get("module"), sp.get("class"), path, q)
         self.out_dir = f"./outputs/{self.key}"
         print(f"  {self.title} 加载完成（{q}-bit）{time.time() - t0:.0f}s")
 
-    def load(self, path, q):
-        raise NotImplementedError
+    def _build(self, module, cls_name, path, q):
+        import importlib
+        if not module or not cls_name:
+            raise SystemExit(f"models.json 里 {self.key} 缺少 module 或 class")
+        cls = getattr(importlib.import_module(module), cls_name)
+        kw = dict(quantize=q, model_path=path)
+        if self.spec.get("model_config"):  # 例如 flux2_klein_4b -> ModelConfig.flux2_klein_4b()
+            from mflux.models.common.config import ModelConfig
+            kw["model_config"] = getattr(ModelConfig, self.spec["model_config"])()
+        return cls(**kw)
 
     def generate(self, prompt, neg, w, h, steps, seed, cfg, init=None, strength=None):
         kw = {}
         if init:
             # mflux 的 image_strength = 保留原图的比例（从第 steps×strength 步开始），与这里的“重画比例”相反
             kw = {"image_path": init, "image_strength": 1 - strength}
+        if self.spec.get("guidance") is not None:
+            kw["guidance"] = self.spec["guidance"]
         result = self.model.generate_image(seed=seed, prompt=prompt, num_inference_steps=steps,
                                            height=h, width=w, **kw)
         ran = steps - max(1, int(steps * (1 - strength))) if init else steps
         return result.image, ran
+
+    def generate_refs(self, prompt, refs, w, h, steps, seed):
+        """以设定图为参考生成（配置了 refs_class 的模型，如 FLUX.2 klein 的多参考图编辑）。按需加载。"""
+        if not self.supports_refs:
+            raise RuntimeError(f"{self.title} 没有配置 refs_class，不支持参考图")
+        if not hasattr(self, "edit"):
+            self.edit = self._build(self.spec.get("refs_module", self.spec.get("module")), self.spec["refs_class"],
+                                    self.path, self.q)
+        result = self.edit.generate_image(seed=seed, prompt=prompt, num_inference_steps=steps,
+                                          height=h, width=w, image_paths=list(refs))
+        return result.image
 
     def cleanup(self):
         gc.collect()
@@ -199,63 +220,31 @@ class MfluxBackend(Backend):
             pass
 
 
-class ZImageTurboBackend(MfluxBackend):
-    key = "z-image-turbo"
-    title = "Z-Image-Turbo（6B，MLX）"
-    preview_steps = final_steps = 9
+class DiffusersBackend(Backend):
+    """diffusers 通用引擎：按配置里的 pipeline 名加载（NVIDIA CUDA 优先，Mac 上用 MPS）。
 
-    def load(self, path, q):
-        from mflux.models.z_image import ZImageTurbo
-        return ZImageTurbo(quantize=q, model_path=path)
-
-
-class Flux2KleinBackend(MfluxBackend):
-    key = "flux2-klein-4b"
-    title = "FLUX.2 klein 4B（MLX）"
-    preview_steps = final_steps = 4
-    supports_refs = True
-
-    def generate_refs(self, prompt, refs, w, h, steps, seed):
-        """以设定图为参考生成（多参考图编辑模式）。mflux 按需加载权重，只用这个方法时不会多占内存。"""
-        if not hasattr(self, "edit"):
-            from mflux.models.common.config import ModelConfig
-            from mflux.models.flux2.variants import Flux2KleinEdit
-            self.edit = Flux2KleinEdit(quantize=self.q, model_path=self.path, model_config=ModelConfig.flux2_klein_4b())
-        result = self.edit.generate_image(seed=seed, prompt=prompt, num_inference_steps=steps,
-                                          height=h, width=w, image_paths=list(refs))
-        return result.image
-
-    def load(self, path, q):
-        from mflux.models.common.config import ModelConfig
-        from mflux.models.flux2.variants import Flux2Klein
-        return Flux2Klein(quantize=q, model_path=path, model_config=ModelConfig.flux2_klein_4b())
-
-
-class DiffusersImageBackend(Backend):
-    """Linux + NVIDIA 上用 diffusers 跑 Z-Image / FLUX.2 klein。模型目录与 Mac 上 mflux 用的相同（diffusers 格式）。
-
-    注意：这部分是为云服务器准备的，作者没有 NVIDIA 机器，尚未实测。
+    NVIDIA 上的配置作者没有实测过。
     """
     env = ".venv-cuda"
-    cfg, supports_neg = None, False
-    default_size = "1024x1024"
-    pipeline = ""
-    guidance = 0.0
+    spec = {}
 
     def __init__(self, **_):
+        sp = self.spec
+        path = resolve_path(sp.get("path", f"./models/{self.key}"))
+        if not os.path.isdir(path):  # 先检查模型，再导入依赖：没下载时给出更直接的提示
+            hint = f"：{sp['download']}" if sp.get("download") else "（Linux 上可用 deploy/setup_cuda.sh）"
+            raise SystemExit(f"找不到模型目录 {path}，先下载模型{hint}")
         import diffusers
         import torch
         self.torch = torch
         self.device = torch_device()
-        path = f"./models/{self.key}"
-        if not os.path.isdir(path):
-            raise SystemExit(f"找不到模型目录 {path}，先运行 deploy/setup_cuda.sh 下载模型")
+        if not hasattr(diffusers, sp.get("pipeline", "")):
+            raise SystemExit(f"当前 diffusers 里没有 {sp.get('pipeline')}，检查 models.json 或升级 diffusers")
         t0 = time.time()
-        cls = getattr(diffusers, self.pipeline)
-        self.pipe = cls.from_pretrained(path, torch_dtype=torch.bfloat16)
+        self.pipe = getattr(diffusers, sp["pipeline"]).from_pretrained(path, torch_dtype=torch.bfloat16)
         vram = torch.cuda.mem_get_info()[1] / 1e9 if self.device == "cuda" else 0  # 显存总量
-        if self.device == "cuda" and vram < 20:
-            self.pipe.enable_model_cpu_offload()   # 显存小于 20GB：按组件在显存和内存之间搬运
+        if self.device == "cuda" and vram < sp.get("offload_below_gb", 20):
+            self.pipe.enable_model_cpu_offload()   # 显存不够：按组件在显存和内存之间搬运
         else:
             self.pipe.to(self.device)
         self.out_dir = f"./outputs/{self.key}"
@@ -263,14 +252,18 @@ class DiffusersImageBackend(Backend):
 
     def generate(self, prompt, neg, w, h, steps, seed, cfg, init=None, strength=None):
         torch = self.torch
-        kw = dict(prompt=prompt, height=h, width=w, num_inference_steps=steps, guidance_scale=self.guidance,
+        guidance = cfg if cfg is not None else self.spec.get("guidance", 0.0)
+        kw = dict(prompt=prompt, height=h, width=w, num_inference_steps=steps, guidance_scale=guidance,
                   generator=torch.Generator("cpu").manual_seed(seed))
+        if self.supports_neg and neg:
+            kw["negative_prompt"] = neg
         if init:
-            img2img = getattr(self, "img2img", None)
-            if not img2img:
-                raise RuntimeError(f"{self.title} 的 CUDA 实现暂不支持 /refine")
+            name = self.spec.get("img2img_pipeline")
+            if not name:
+                raise RuntimeError(f"{self.title} 没有配置 img2img_pipeline，不支持 /refine")
+            import diffusers
             from PIL import Image
-            pipe = img2img.from_pipe(self.pipe)
+            pipe = getattr(diffusers, name).from_pipe(self.pipe)
             img = pipe(image=Image.open(init).convert("RGB"), strength=strength, **kw).images[0]
             return img, max(1, int(steps * strength))
         return self.pipe(**kw).images[0], steps
@@ -279,28 +272,51 @@ class DiffusersImageBackend(Backend):
         torch_empty_cache(self.torch)
 
 
-class ZImageTurboCuda(DiffusersImageBackend):
-    key = "z-image-turbo"
-    title = "Z-Image-Turbo（6B，CUDA）"
-    pipeline = "ZImagePipeline"
-    preview_steps = final_steps = 8
-    guidance = 0.0
+# ---------------- 按配置生成后端 ----------------
 
-    @property
-    def img2img(self):
-        import diffusers
-        return diffusers.ZImageImg2ImgPipeline
+ENGINES = {"mflux": MfluxBackend, "diffusers": DiffusersBackend, "longcat": LongCatBackend}
+HERE = os.path.dirname(os.path.abspath(__file__))
+PLATFORM = "darwin" if platform.system() == "Darwin" else "linux"
 
 
-class Flux2KleinCuda(DiffusersImageBackend):
-    key = "flux2-klein-4b"
-    title = "FLUX.2 klein 4B（CUDA）"
-    pipeline = "Flux2KleinPipeline"
-    preview_steps = final_steps = 4
-    guidance = 1.0
+def resolve_path(p):
+    return p if os.path.isabs(p) else os.path.normpath(os.path.join(HERE, p))
 
 
-if platform.system() == "Darwin":
-    BACKENDS = {b.key: b for b in (LongCatBackend, ZImageTurboBackend, Flux2KleinBackend)}
-else:  # Linux / NVIDIA：同名模型换成 diffusers 实现，分镜文件和命令不用改
-    BACKENDS = {b.key: b for b in (LongCatBackend, ZImageTurboCuda, Flux2KleinCuda)}
+def load_models():
+    """读取 models.json + models.local.json（同名模型按字段覆盖），并套用当前平台（darwin/linux）的配置。"""
+    import json
+    merged = {}
+    for name in ("models.json", "models.local.json"):
+        path = os.path.join(HERE, name)
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            for key, spec in json.load(f).items():
+                if key.startswith("_") or not isinstance(spec, dict):
+                    continue
+                merged.setdefault(key, {}).update(spec)
+    out = {}
+    for key, spec in merged.items():
+        spec = {**{k: v for k, v in spec.items() if k not in ("darwin", "linux")}, **(spec.get(PLATFORM) or {})}
+        if spec.get("enabled") is False or not spec.get("engine"):
+            continue  # 当前平台没有配置引擎，或被禁用
+        out[key] = spec
+    return out
+
+
+def make_backend(key, spec):
+    base = ENGINES.get(spec["engine"])
+    if base is None:
+        raise SystemExit(f"models.json 里 {key} 的 engine“{spec['engine']}”不支持，可选：{'、'.join(ENGINES)}")
+    steps = spec.get("steps", base.final_steps)
+    attrs = dict(key=key, spec=spec, title=spec.get("title", key), env=spec.get("env", base.env),
+                 final_steps=steps, preview_steps=spec.get("preview_steps", steps),
+                 default_size=spec.get("size", base.default_size), cfg=spec.get("cfg"),
+                 supports_neg=spec.get("supports_neg", False), supports_refs=bool(spec.get("refs_class")))
+    if spec.get("out_dir"):
+        attrs["out_dir"] = spec["out_dir"]
+    return type(f"{base.__name__}_{key}", (base,), attrs)
+
+
+BACKENDS = {key: make_backend(key, spec) for key, spec in load_models().items()}
